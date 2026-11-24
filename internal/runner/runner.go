@@ -38,13 +38,23 @@ const (
 // positional parameters, never interpolated. It is a single line so it also
 // survives login shells that dislike newlines inside quotes.
 //
-// The script first reports "<marker> ready". psudo sends the password only
+// The script first asks sudoers (sudo -n -l -l) which rule decides this exact
+// command. When that rule is NOPASSWD (Options: !authenticate), it reports
+// "<marker> nopw" and runs the command with sudo -n: psudo shows no dialog
+// and sends nothing. This covers an account with a NOPASSWD rule that also
+// has a rule needing a password (such as the sudo group), where sudo -v asks
+// for a password (verifypw=all). sudo -n still decides: if it does need a
+// password after all, it refuses and nothing runs. A sudo whose listing
+// does not name the matching rule takes the password path below.
+//
+// Otherwise the script reports "<marker> ready". psudo sends the password only
 // after that line, so the password never goes to a target that is not running
 // this script: a forced command, a login shell that is not a POSIX shell or a
 // startup file that reads stdin gets no input, and cannot echo the password
 // back into the output.
 //
-// The password is the first line of stdin. It is read into a shell variable
+// The password is the first line of stdin; without a whole line (psudo closed
+// the connection, for example on a cancelled dialog) the script exits. It is read into a shell variable
 // (never exported, never in any process's argv) and stdin is then closed for
 // everything that follows, so the command can never read it. Each sudo that
 // needs it receives it through a pipe from the printf builtin.
@@ -70,7 +80,10 @@ const (
 const Script = `s=$1; m=$2; shift 2; ` +
 	`if [ -z "$s" ]; then for c in /usr/bin/sudo /bin/sudo /usr/local/bin/sudo /run/wrappers/bin/sudo /run/current-system/sw/bin/sudo; do if [ -x "$c" ]; then s=$c; break; fi; done; fi; ` +
 	`if [ -z "$s" ]; then echo 'psudo: sudo not found on target' >&2; printf '%s nosudo\n' "$m"; exit 1; fi; ` +
-	`printf '%s ready\n' "$m"; IFS= read -r p || p=; exec </dev/null; ` +
+	`if LC_ALL=C "$s" -n -l -l -- "$@" </dev/null 2>/dev/null | ` +
+	`awk '/^(Sudoers entry|LDAP Role)/{a=0} /^ *Options:.*!authenticate/{a=1} /^ *Matched:/{if(a)f=1} END{exit !f}'; ` +
+	`then printf '%s nopw\n' "$m"; exec </dev/null; "$s" -n -- "$@"; exit; fi; ` +
+	`printf '%s ready\n' "$m"; IFS= read -r p || exit 1; exec </dev/null; ` +
 	`"$s" -k; ` +
 	`f=$(mktemp 2>/dev/null) || f=/dev/null; ` +
 	`if printf '%s\n' "$p" | LC_ALL=C "$s" -S -p '' -v 2>"$f"; then t=ok; else ` +
@@ -104,6 +117,7 @@ const (
 	statusAuthFail = "authfail"
 	statusNoSudo   = "nosudo"
 	statusNoShell  = "noshell"
+	statusNoPW     = "nopw"
 )
 
 // maxPreamble bounds output (such as login banners) accepted before the marker.
@@ -225,11 +239,11 @@ func (r *Runner) Run(ctx context.Context, host string, argv []string) int {
 				select {
 				case sig := <-r.Signals:
 					mu.Lock()
+					// cancel also closes a dialog waiting for the password.
 					if proc != nil {
 						proc.Signal(sig)
-					} else {
-						cancel()
 					}
+					cancel()
 					mu.Unlock()
 				case <-done:
 					return
@@ -297,20 +311,7 @@ func (r *Runner) Run(ctx context.Context, host string, argv []string) int {
 		}
 	}
 
-	if !fromCache {
-		pw, err := r.Ask(ctx, prompt.Request{Title: r.Title, Host: host, Command: shquote.Visible(shquote.Join(argv)),
-			Timeout: prompt.DefaultTimeout})
-		switch {
-		case errors.Is(err, prompt.ErrNoProvider):
-			r.fail("no password dialog is available (a logged-in desktop session is required)")
-			return ExitNoProvider
-		case err != nil:
-			r.fail("password dialog was cancelled or timed out; the command was not run")
-			return ExitCancelled
-		}
-		password = pw
-	}
-	defer zero(password)
+	defer func() { zero(password) }()
 	if ctx.Err() != nil {
 		r.fail("interrupted; the command was not run")
 		return ExitCancelled
@@ -353,7 +354,40 @@ func (r *Runner) Run(ctx context.Context, host string, argv []string) int {
 	timer := time.AfterFunc(r.ReadyWait(), func() { cmd.Process.Kill() })
 	status, overflow := r.awaitStatus(reader, marker)
 	timer.Stop()
+	if status == statusNoPW && !overflow {
+		// sudoers lets this exact command run without a password, so there
+		// is nothing to ask: no dialog, and nothing is written to stdin.
+		stdin.Close()
+		zero(password)
+		release()
+		io.Copy(r.Stdout, reader)
+		cmd.Wait()
+		return exitCode(cmd.ProcessState)
+	}
 	sent := status == StatusReady && !overflow
+	if sent && !fromCache {
+		// The dialog opens only once the target has said it needs the
+		// password. The script waits on stdin meanwhile; on a cancel it is
+		// killed, and it exits by itself if stdin closes without a line.
+		pw, err := r.Ask(ctx, prompt.Request{Title: r.Title, Host: host, Command: shquote.Visible(shquote.Join(argv)),
+			Timeout: prompt.DefaultTimeout})
+		if err == nil && ctx.Err() != nil {
+			zero(pw)
+			err = prompt.ErrCancelled
+		}
+		if err != nil {
+			cmd.Process.Kill()
+			stdin.Close()
+			cmd.Wait()
+			if errors.Is(err, prompt.ErrNoProvider) {
+				r.fail("no password dialog is available (a logged-in desktop session is required)")
+				return ExitNoProvider
+			}
+			r.fail("password dialog was cancelled or timed out; the command was not run")
+			return ExitCancelled
+		}
+		password = pw
+	}
 	if sent {
 		// The password goes only to the pipe; a write error means the child
 		// already exited, which the marker check below reports.

@@ -77,7 +77,7 @@ func TestAskOutcomes(t *testing.T) {
 		{"s3cret\n", 0, nil, nil, "s3cret"},
 		{"", 1, nil, ErrCancelled, ""},
 		{"", 5, nil, ErrCancelled, ""}, // zenity timeout
-		{"\n", 0, nil, nil, ""}, // OK on an empty field
+		{"\n", 0, nil, nil, ""},        // OK on an empty field
 		{"", 0, nil, nil, ""},
 		{"a\nb\n", 0, nil, ErrCancelled, ""},
 		{"", -1, errors.New("not found"), ErrNoProvider, ""},

@@ -127,9 +127,26 @@ func fakeSudo() int {
 			return 0
 		}
 		return 1
+	case len(args) >= 5 && reflect.DeepEqual(args[:4], []string{"-n", "-l", "-l", "--"}):
+		// The listing of sudo 1.9 for one command: the rule that decides it.
+		// "nopwcmd" models a NOPASSWD rule for the command next to a rule
+		// that needs a password, so -v needs one (verifypw=all).
+		switch {
+		case mode("forbidcmd"):
+			return 1
+		case mode("oldsudo"):
+			fmt.Println(args[4])
+			return 0
+		case mode("nopasswd") || mode("nopwcmd"):
+			fmt.Printf("\nSudoers entry: /etc/sudoers.d/test\n    RunAsUsers: ALL\n    Options: !authenticate\n"+
+				"    Commands:\n\tALL\n    Matched: %s\n", strings.Join(args[4:], " "))
+			return 0
+		}
+		fmt.Fprintln(os.Stderr, "sudo: a password is required")
+		return 1
 	case len(args) >= 3 && args[0] == "-n" && args[1] == "--":
 		// Real sudo -n reports a disallowed command this way, too.
-		if !valid || mode("forbidcmd") {
+		if !(valid || mode("nopwcmd")) || mode("forbidcmd") {
 			fmt.Fprintln(os.Stderr, "sudo: a password is required")
 			return 1
 		}
@@ -397,21 +414,32 @@ func TestUnreadPasswordNeverReachesCommand(t *testing.T) {
 	})
 }
 
-// Spec §6.3: invalidate, validate, execute, in that order.
+func (f *fixture) sudoCalls() [][]string {
+	var steps [][]string
+	for _, line := range strings.Split(strings.TrimSpace(f.read("sudo.log")), "\n") {
+		if line == "" {
+			continue
+		}
+		var c struct{ Argv []string }
+		json.Unmarshal([]byte(line), &c)
+		steps = append(steps, c.Argv)
+	}
+	return steps
+}
+
+// listing is the sudoers lookup the script makes before anything else.
+func listing(argv ...string) []string { return append([]string{"-n", "-l", "-l", "--"}, argv...) }
+
+// Spec §6.3: look up the rule, invalidate, validate, execute, in that order.
 func TestExecutionSequence(t *testing.T) {
 	forEachTarget(t, func(t *testing.T, f *fixture) {
 		f.run("true")
-		var steps [][]string
-		for _, line := range strings.Split(strings.TrimSpace(f.read("sudo.log")), "\n") {
-			var c struct{ Argv []string }
-			json.Unmarshal([]byte(line), &c)
-			steps = append(steps, c.Argv)
-		}
+		steps := f.sudoCalls()
 		wrapped := []string{"/bin/sh", "-c", `exec "$@" </dev/null`, "psudo", "true"}
 		allowed := []string{"-k", "-S", "-p", "", "-l", "--", "true"}
-		want := [][]string{{"-k"}, {"-S", "-p", "", "-v"}, allowed, {"-n", "-v"}, {"-n", "--", "true"}, {"-k"}}
+		want := [][]string{listing("true"), {"-k"}, {"-S", "-p", "", "-v"}, allowed, {"-n", "-v"}, {"-n", "--", "true"}, {"-k"}}
 		if f.noticket {
-			want = [][]string{{"-k"}, {"-S", "-p", "", "-v"}, allowed, {"-n", "-v"},
+			want = [][]string{listing("true"), {"-k"}, {"-S", "-p", "", "-v"}, allowed, {"-n", "-v"},
 				append([]string{"-k", "-S", "-p", "", "-l", "--"}, wrapped...),
 				append([]string{"-k", "-S", "-p", "", "--"}, wrapped...), {"-k"}}
 		}
@@ -517,11 +545,9 @@ func TestDialogOutcomes(t *testing.T) {
 			if code := f.run("true"); code != tc.code {
 				t.Fatalf("exit %d, want %d", code, tc.code)
 			}
-			if f.read("sudo.log") != "" {
-				t.Fatal("sudo ran although no password was given")
-			}
-			if strings.Count(f.read("ssh.log"), "\n") > 1 {
-				t.Fatal("ssh ran the command although no password was given")
+			// Only the lookup that found a password is needed.
+			if calls := f.sudoCalls(); !reflect.DeepEqual(calls, [][]string{listing("true")}) {
+				t.Fatalf("sudo calls %q although no password was given", calls)
 			}
 		})
 	}
@@ -553,7 +579,8 @@ func TestPasswordIsNotSentToATargetThatDoesNotRunTheScript(t *testing.T) {
 	if code != runner.ExitAuthFailed || !strings.Contains(f.err.String(), "the password was not sent") {
 		t.Fatalf("exit %d stdout %q stderr %q", code, f.out.String(), f.err.String())
 	}
-	if len(f.asks) != 1 || strings.Contains(f.out.String(), "unknown command") {
+	// The dialog opens only once the script asks for the password.
+	if len(f.asks) != 0 || strings.Contains(f.out.String(), "unknown command") {
 		t.Fatalf("asks %d, stdout %q", len(f.asks), f.out.String())
 	}
 	f.assertNoLeak()
@@ -779,6 +806,55 @@ func TestEmptyPasswordIsSentAndCached(t *testing.T) {
 	}
 	if len(f.asks) != 1 || store.writes != 1 {
 		t.Fatalf("asks=%d writes=%d", len(f.asks), store.writes)
+	}
+}
+
+// A NOPASSWD rule for the command next to a rule that needs a password (the
+// sudo group): sudo -v wants a password, but the command needs none. psudo
+// shows no dialog, sends nothing, and runs it with sudo -n.
+func TestNoPasswordRuleRunsWithoutDialog(t *testing.T) {
+	forEachTarget(t, func(t *testing.T, f *fixture) {
+		os.WriteFile(filepath.Join(f.state, "nopwcmd"), nil, 0o600)
+		store := &memStore{}
+		f.r.Store = func() (cache.Store, error) { return store, nil }
+		code := f.run("sh", "-c", "echo out; cat; exit 3")
+		if code != 3 || f.out.String() != "out\n" || len(f.asks) != 0 {
+			t.Fatalf("exit %d stdout %q asks %d stderr %q", code, f.out.String(), len(f.asks), f.err.String())
+		}
+		want := [][]string{listing("sh", "-c", "echo out; cat; exit 3"), {"-n", "--", "sh", "-c", "echo out; cat; exit 3"}}
+		if calls := f.sudoCalls(); !reflect.DeepEqual(calls, want) {
+			t.Fatalf("sudo calls %q, want %q", calls, want)
+		}
+		if store.writes != 0 {
+			t.Fatal("a password was cached although none was asked for")
+		}
+	})
+}
+
+// A sudo whose listing does not name the matching rule gets the password path.
+func TestListingWithoutMatchedRuleAsksForPassword(t *testing.T) {
+	forEachTarget(t, func(t *testing.T, f *fixture) {
+		os.WriteFile(filepath.Join(f.state, "nopwcmd"), nil, 0o600)
+		os.WriteFile(filepath.Join(f.state, "oldsudo"), nil, 0o600)
+		if code := f.run("true"); code != 0 || len(f.asks) != 1 {
+			t.Fatalf("exit %d asks %d stderr %q", code, len(f.asks), f.err.String())
+		}
+	})
+}
+
+// When psudo goes away without sending a line (for example after a cancelled
+// dialog), the script stops: it never goes on with an empty password.
+func TestScriptStopsWithoutAPasswordLine(t *testing.T) {
+	f := newFixture(t, "")
+	os.WriteFile(filepath.Join(f.state, "password"), nil, 0o600)
+	cmd := exec.Command(f.r.Shell, "-c", runner.Script, "psudo", f.r.LocalSudo, "m", "true")
+	cmd.Env = f.r.LocalEnv
+	out, _ := cmd.Output()
+	if string(out) != "m ready\n" || cmd.ProcessState.ExitCode() != 1 {
+		t.Fatalf("exit %d stdout %q", cmd.ProcessState.ExitCode(), out)
+	}
+	if calls := f.sudoCalls(); !reflect.DeepEqual(calls, [][]string{listing("true")}) {
+		t.Fatalf("sudo calls %q", calls)
 	}
 }
 
