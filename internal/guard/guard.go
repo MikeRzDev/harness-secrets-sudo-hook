@@ -19,11 +19,23 @@ var pattern = regexp.MustCompile(`(^|[^A-Za-z0-9_])(sudo|sshpass)([^A-Za-z0-9_]|
 // sshpass, or read psudo's password cache (see shell.go).
 func Denied(command string) bool { return judge(command, "") != allow }
 
-// Reason is shown to the model when a command is denied.
+// Reason is shown to the model when a command is denied: one the guard could
+// not convert to psudo by itself. A harness tends to read a denial as a stop,
+// so it says plainly that the task goes on with psudo.
 func Reason(psudo string) string {
-	return "Use `psudo <command>` (local) or `psudo -H <host> <command>` (remote). " +
-		"psudo is installed at " + shquote.Quote(psudo) + "; invoke it by that path if `psudo` is not on PATH. " +
-		"Never ask for or handle the password."
+	p := shquote.Quote(psudo)
+	return "Not run: on this machine root goes through psudo instead of sudo. This is not a refusal; continue the task by " +
+		"running the same command through psudo: " + p + " <command> [args...] on this computer, " + p +
+		" -H <ssh-host> <command> [args...] on an SSH host, or " + p + " sh -c '...' for a pipeline or a command that " +
+		"reads stdin (psudo closes stdin). psudo takes no sudo options and shows the user its own password dialog; " +
+		"never ask for or handle the password. If sudo is only text here (in a script or a file being written), " +
+		"write that text with the file editing tool instead."
+}
+
+// Converted is the note added for the model when its command was converted.
+func Converted(command string) string {
+	return "psudo's guard converted this command's sudo to psudo, which runs it as root and shows the user its own " +
+		"password dialog when one is needed. What ran: " + command + ". Use psudo directly next time."
 }
 
 // CacheReason is shown when a command would read psudo's password cache.
@@ -52,12 +64,38 @@ func denyWith(out io.Writer, reason string) error {
 	}})
 }
 
-// ClaudeCode reads a PreToolUse event and writes a deny decision when the
-// command invokes sudo or sshpass. Unparseable input is denied (fail closed).
+// convert writes the decision that runs the converted command instead. It
+// skips Claude Code's own permission prompt only in a session that bypasses
+// permissions; any other mode asks, as it would have for sudo. The input is
+// sent whole, because updatedInput replaces it.
+func convert(out io.Writer, mode string, input map[string]json.RawMessage, command string) error {
+	raw, err := json.Marshal(command)
+	if err != nil {
+		return err
+	}
+	input["command"] = raw
+	decision := "ask"
+	if mode == "bypassPermissions" {
+		decision = "allow"
+	}
+	return encode(out, map[string]any{"hookSpecificOutput": map[string]any{
+		"hookEventName":            "PreToolUse",
+		"permissionDecision":       decision,
+		"permissionDecisionReason": "sudo converted to psudo: " + command,
+		"updatedInput":             input,
+		"additionalContext":        Converted(command),
+	}})
+}
+
+// ClaudeCode reads a PreToolUse event. A command that runs sudo is converted
+// to psudo when that can be done exactly (see rewrite.go); otherwise, and for
+// sshpass and reads of psudo's credential store, it writes a deny decision.
+// Unparseable input is denied (fail closed).
 func ClaudeCode(in io.Reader, out io.Writer, psudo string) error {
 	var event struct {
-		ToolName  string          `json:"tool_name"`
-		ToolInput json.RawMessage `json:"tool_input"`
+		ToolName       string          `json:"tool_name"`
+		ToolInput      json.RawMessage `json:"tool_input"`
+		PermissionMode string          `json:"permission_mode"`
 	}
 	if err := json.NewDecoder(in).Decode(&event); err != nil {
 		return deny(out, psudo)
@@ -76,6 +114,10 @@ func ClaudeCode(in io.Reader, out io.Writer, psudo string) error {
 	}
 	switch judge(*input.Command, psudo) {
 	case denyRoot:
+		var whole map[string]json.RawMessage
+		if converted, ok := Rewrite(*input.Command, psudo); ok && json.Unmarshal(event.ToolInput, &whole) == nil {
+			return convert(out, event.PermissionMode, whole, converted)
+		}
 		return deny(out, psudo)
 	case denyCache:
 		return denyWith(out, CacheReason)

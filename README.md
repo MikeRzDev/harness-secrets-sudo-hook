@@ -83,11 +83,21 @@ the agent knows to use `psudo` without you telling it.
 | --- | --- | --- |
 | Installed at | `~/.claude/hooks/psudo` | `$CODEX_HOME/root-hook/psudo` |
 | At session start | A `SessionStart` hook tells the model: root goes through `psudo`, `psudo -H` for remote hosts, never handle passwords, and what each exit code means. | The same, through Codex's `SessionStart` hook (trust it once in `/hooks`). |
-| Before each command | A `PreToolUse` guard denies `sudo` and `sshpass`, and denies credential-store reads that could reach harness-secrets-sudo-hook's password cache or stored secrets. It points the model to `psudo`. | Codex has no deny hook; the session context is the guidance. |
+| Before each command | A `PreToolUse` guard converts `sudo` to `psudo` and lets the command go ahead. It denies what it cannot convert exactly, `sshpass`, and credential-store reads that could reach harness-secrets-sudo-hook's password cache or stored secrets, and its message gives the `psudo` form to use. | Codex has no deny hook; the session context is the guidance. |
 | Approvals | The harness's own approval prompt still applies to every command. harness-secrets-sudo-hook adds its dialog on top of it. | Same. |
 
-**The guard.** The Claude Code guard reads each command the way the shell does.
-It denies `sudo` or `sshpass` where they would actually run: as a command, after
+**The guard.** A harness reads a denied command as a stop, so the guard converts
+instead of denying wherever it can do so exactly: `sudo cmd` becomes `psudo cmd`,
+`ssh host sudo cmd` becomes `psudo -H host cmd`, and a sudo that reads a pipe
+(`echo x | sudo tee f`) becomes `psudo sh -c 'echo x | tee f'`, because psudo
+closes the command's stdin. The model is told what ran. In a session that
+bypasses permissions the converted command runs at once; in any other mode
+Claude Code asks you first, as it would have for sudo. It still denies what it
+cannot convert (another user with `-u`, `-S`, `-i`, sudo inside `sh -c` or a
+script, a pipeline with `$` or `~` that would expand as root), with the `psudo`
+form to use instead.
+
+It finds `sudo` or `sshpass` where they would actually run: as a command, after
 `|` or `&&`, inside `$(…)`, through wrappers such as `env`, `xargs` or
 `find -exec`, or inside code given to `sh -c`, `ssh`, `python3 -c` and the like.
 The word as plain text is fine for data tools (`cat`, `tee`, `echo`, `grep`,
@@ -106,8 +116,8 @@ sequenceDiagram
     participant U as You
     participant T as Target (local or SSH)
     M->>K: Bash: sudo …
-    K-->>M: denied, use psudo
-    M->>P: psudo [-H host] cmd
+    K-->>M: converted to psudo [-H host] cmd
+    K->>P: psudo [-H host] cmd
     P->>U: dialog showing host + command
     U-->>P: password
     P->>T: password over stdin pipe / SSH channel

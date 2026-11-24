@@ -38,25 +38,27 @@ provider.
 
 ## What the hook does
 
-The hook **denies** any Bash command that contains `sudo` or `sshpass` as a
-standalone word, and tells the model:
+The hook **converts** a Bash command's `sudo` to `psudo` and lets it go ahead,
+because a harness reads a denied command as a stop. It tells the model what ran.
+In a session that bypasses permissions the converted command runs at once; in
+any other mode Claude Code's permission prompt shows you the converted command.
+What it cannot convert exactly, and `sshpass`, it denies with a message that says
+the task goes on through psudo and gives the form to use.
 
-> Use `psudo <command>` (local) or `psudo -H <host> <command>` (remote). … Never ask for or handle the password.
-
-The model then calls `~/.claude/hooks/psudo …`. Claude Code's normal permission
-prompt still applies to that call. The hook is best effort. A command that gets
-past it still fails safely, because sudo without a terminal or password cannot
-authenticate.
+The hook is best effort. A command that gets past it still fails safely,
+because sudo without a terminal or password cannot authenticate.
 
 | Command | Decision |
 | --- | --- |
-| `sudo apt install x` | deny |
-| `ssh host sudo systemctl restart nginx` | deny |
+| `sudo apt install x` | runs `psudo apt install x` |
+| `ssh host sudo systemctl restart nginx` | runs `psudo -H host systemctl restart nginx` |
+| `echo x \| sudo tee -a /etc/hosts` | runs `psudo sh -c 'echo x \| tee -a /etc/hosts'` |
+| `psudo ls && sudo rm x` | runs `psudo ls && psudo rm x` |
 | `echo … \| sudo -S …` | deny |
+| `sudo -u postgres psql`, `sudo -i` | deny |
+| `bash -c 'sudo id'` | deny |
 | `sshpass -p … ssh host` | deny |
 | `psudo apt install x` | allow |
-| `psudo -H host systemctl restart nginx` | allow |
-| `psudo ls && sudo rm x` | deny |
 | `cat /etc/sudoers` | allow |
 
 To avoid wasted turns, you can add one line to your `CLAUDE.md`: *"Privileged
@@ -67,7 +69,7 @@ store a password."*
 
 Ask Claude Code to run each of these:
 
-1. `sudo id -u`: denied, with the `psudo` hint.
+1. `sudo id -u`: converted, it runs as `~/.claude/hooks/psudo id -u`.
 2. `~/.claude/hooks/psudo id -u`: one dialog naming *this computer* and `id -u`, then `0`.
    With the cache off (the default) every run shows the dialog.
 3. `~/.claude/hooks/psudo -H <your-ssh-alias> id -u`: a dialog naming the host, then `0`.

@@ -40,6 +40,11 @@ func TestVersionAndHelp(t *testing.T) {
 func TestHookDispatch(t *testing.T) {
 	var out bytes.Buffer
 	in := strings.NewReader(`{"tool_name":"Bash","tool_input":{"command":"sudo id"}}`)
+	if run([]string{"--hook=claude-code"}, in, &out, &out) != 0 || !strings.Contains(out.String(), `"updatedInput"`) {
+		t.Fatal(out.String())
+	}
+	out.Reset()
+	in = strings.NewReader(`{"tool_name":"Bash","tool_input":{"command":"sudo -i"}}`)
 	if run([]string{"--hook=claude-code"}, in, &out, &out) != 0 || !strings.Contains(out.String(), `"deny"`) {
 		t.Fatal(out.String())
 	}

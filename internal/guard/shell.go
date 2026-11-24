@@ -34,9 +34,10 @@ func worse(a, b verdict) verdict {
 // word is one shell word after quote removal. Expansions stay in the text as
 // written ($x, $(…)), and dynamic records that one was present.
 type word struct {
-	text    string
-	dynamic bool
-	opaque  bool // contains $'…', whose text cannot be judged
+	text       string
+	dynamic    bool
+	opaque     bool // contains $'…', whose text cannot be judged
+	start, end int  // its place in the source
 }
 
 type heredoc struct {
@@ -45,9 +46,11 @@ type heredoc struct {
 }
 
 type simpleCmd struct {
-	words    []word
-	heredocs []*heredoc
-	herestr  []string
+	words      []word
+	heredocs   []*heredoc
+	herestr    []string
+	input      bool // a < redirection: the program reads stdin
+	start, end int  // its place in the source, redirections included
 }
 
 type pipeline struct{ cmds []*simpleCmd }
@@ -70,6 +73,7 @@ type parser struct {
 	pipe    *pipeline
 	cmd     *simpleCmd
 	pending []pendingDoc
+	tok     int // where the current token starts
 }
 
 const maxDepth = 16
@@ -258,7 +262,7 @@ func (p *parser) endPipe() {
 
 func (p *parser) current() *simpleCmd {
 	if p.cmd == nil {
-		p.cmd = &simpleCmd{}
+		p.cmd = &simpleCmd{start: p.tok}
 	}
 	return p.cmd
 }
@@ -271,6 +275,7 @@ func (p *parser) parse() {
 	atWordStart := true
 	for !p.eof() && !p.bad {
 		c := p.src[p.i]
+		p.tok = p.i
 		switch {
 		case isBlank(c):
 			p.i++
@@ -323,6 +328,9 @@ func (p *parser) parse() {
 			cmd := p.current()
 			cmd.words = append(cmd.words, w)
 		}
+		if p.cmd != nil {
+			p.cmd.end = p.i
+		}
 		atWordStart = true
 	}
 	if p.bad {
@@ -357,6 +365,9 @@ func (p *parser) redirect() {
 		p.i++
 	}
 	op := p.src[start:p.i]
+	if strings.HasPrefix(op, "<") && !strings.HasPrefix(op, "<<") {
+		p.current().input = true
+	}
 	switch {
 	case strings.HasPrefix(op, "<<<"):
 		w := p.nextWord()
@@ -503,9 +514,10 @@ func matchParen(s string, start int) (int, bool) {
 }
 
 // word reads one word, removing quotes and checking substitutions.
-func (p *parser) word() word {
+func (p *parser) word() (w word) {
 	var b strings.Builder
-	w := word{}
+	w = word{start: p.i}
+	defer func() { w.end = p.i }() // a named result, so every return carries it
 	for !p.eof() {
 		c := p.src[p.i]
 		if isBlank(c) || c == '\n' || isOp(c) {

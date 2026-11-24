@@ -16,9 +16,18 @@ func decide(t *testing.T, input string) string {
 	if out.Len() == 0 {
 		return "allow"
 	}
-	var res struct{ HookSpecificOutput map[string]string }
+	var res struct{ HookSpecificOutput map[string]any }
 	json.Unmarshal(out.Bytes(), &res)
-	return res.HookSpecificOutput["permissionDecision"]
+	d, _ := res.HookSpecificOutput["permissionDecision"].(string)
+	return d
+}
+
+// verdictOf is what the guard sees a command do, before any conversion.
+func verdictOf(command string) string {
+	if judge(command, "/home/u/.claude/hooks/psudo") == allow {
+		return "allow"
+	}
+	return "deny"
 }
 
 func bash(command string) string {
@@ -147,7 +156,7 @@ func TestDecisionMatrix(t *testing.T) {
 		"echo $((1 + 2))":                     "allow",
 		"echo ${HOME}/notes":                  "allow",
 	} {
-		if got := decide(t, bash(command)); got != want {
+		if got := verdictOf(command); got != want {
 			t.Errorf("%q: %s, want %s", command, got, want)
 		}
 	}
@@ -209,7 +218,7 @@ func TestPasswordCacheReadsAreDenied(t *testing.T) {
 		"/home/u/.claude/hooks/psudo vim /etc/security/limits.conf":                   "allow",
 		"/home/u/.claude/hooks/psudo -H web1 --secret-file K=kube -- kubectl get pod": "allow",
 	} {
-		if got := decide(t, bash(command)); got != want {
+		if got := verdictOf(command); got != want {
 			t.Errorf("%q: %s, want %s", command, got, want)
 		}
 	}
@@ -220,10 +229,86 @@ func TestPasswordCacheReadsAreDenied(t *testing.T) {
 	}
 }
 
+// A command whose sudo can be converted runs as psudo instead of being
+// denied; "" means it cannot be converted exactly and is denied.
+func TestConversions(t *testing.T) {
+	const p = "/home/u/.claude/hooks/psudo"
+	for command, want := range map[string]string{
+		"sudo apt install x":                        p + " apt install x",
+		"sudo -n -E -u root -- systemctl restart x": p + " systemctl restart x",
+		"sudo -nu root id":                          p + " id",
+		"sudo -p 'pw: ' id":                         p + " id",
+		"/usr/bin/sudo id":                          p + " id",
+		"FOO=1 sudo id":                             "FOO=1 " + p + " id",
+		"sudo apt update && sudo apt upgrade -y":    p + " apt update && " + p + " apt upgrade -y",
+		"if true; then sudo id; fi":                 "if true; then " + p + " id; fi",
+		"(sudo id)":                                 "(" + p + " id)",
+		"sudo cat /etc/shadow | grep root":          p + " cat /etc/shadow | grep root",
+		"sudo ls /root 2>/dev/null":                 p + " ls /root 2>/dev/null",
+		"timeout 5 sudo id":                         "timeout 5 " + p + " id",
+		"xargs sudo rm < list":                      "xargs " + p + " rm < list",
+		"find . -name x -exec sudo rm {} +":         "find . -name x -exec " + p + " rm {} +",
+		"ssh host sudo systemctl restart nginx":     p + " -H host systemctl restart nginx",
+		"ssh me@web-1 sudo -n apt update":           p + " -H me@web-1 apt update",
+		// psudo closes stdin: what the command reads is produced inside it.
+		"echo 'a b' | sudo tee -a /etc/hosts": p + ` sh -c 'echo '"'"'a b'"'"' | tee -a /etc/hosts'`,
+		"sudo tee /etc/x < local.conf":        p + " sh -c 'tee /etc/x < local.conf'",
+
+		"echo secret | sudo -S id":              "", // a password on stdin
+		"sudo -u postgres psql":                 "", // another user
+		"sudo -i":                               "",
+		"sudo -s":                               "",
+		"sudo":                                  "",
+		"sudo -v":                               "",
+		"sshpass -p pw ssh host":                "",
+		"ssh -p 2222 host sudo id":              "", // ssh options
+		"ssh host 'sudo systemctl restart x'":   "", // remote shell code
+		"ssh host sudo 'id; id'":                "",
+		"echo x | ssh host sudo tee /etc/x":     "",
+		"echo $HOME | sudo tee /etc/x":          "", // would expand as root
+		"cat ~/x | sudo tee /etc/x":             "",
+		"sudo tee /etc/x <<'EOF'\nx\nEOF":       "",
+		"echo $(sudo id)":                       "",
+		"bash -c 'sudo id'":                     "",
+		"harness-secrets-sudo-hook/sudo id":     "",
+		"python3 - <<'EOF'\nprint('sudo')\nEOF": "",
+	} {
+		b, _ := json.Marshal(map[string]any{"tool_name": "Bash", "permission_mode": "bypassPermissions",
+			"tool_input": map[string]any{"command": command, "description": "d", "timeout": 5}})
+		var out bytes.Buffer
+		if err := ClaudeCode(bytes.NewReader(b), &out, p); err != nil {
+			t.Fatal(err)
+		}
+		var res struct {
+			HookSpecificOutput struct {
+				PermissionDecision string
+				UpdatedInput       map[string]any
+				AdditionalContext  string
+			}
+		}
+		json.Unmarshal(out.Bytes(), &res)
+		h := res.HookSpecificOutput
+		if want == "" {
+			if h.PermissionDecision != "deny" {
+				t.Errorf("%q: %s %v, want deny", command, h.PermissionDecision, h.UpdatedInput)
+			}
+			continue
+		}
+		if h.PermissionDecision != "allow" || h.UpdatedInput["command"] != want || h.UpdatedInput["description"] != "d" ||
+			h.UpdatedInput["timeout"] != 5.0 || !strings.Contains(h.AdditionalContext, want) {
+			t.Errorf("%q: %s %q, want %q", command, h.PermissionDecision, h.UpdatedInput["command"], want)
+		}
+	}
+	// Outside bypassPermissions the user is asked, as for sudo itself.
+	if got := decide(t, bash("sudo id")); got != "ask" {
+		t.Fatalf("default mode: %s, want ask", got)
+	}
+}
+
 func TestReasonAndFailClosed(t *testing.T) {
 	var out bytes.Buffer
-	ClaudeCode(strings.NewReader(bash("sudo id")), &out, "/p/psudo")
-	if !strings.Contains(out.String(), "`psudo -H <host> <command>`") || !strings.Contains(out.String(), "/p/psudo") {
+	ClaudeCode(strings.NewReader(bash("sudo -i")), &out, "/p/psudo")
+	if !strings.Contains(out.String(), "This is not a refusal") || !strings.Contains(out.String(), "/p/psudo -H <ssh-host>") {
 		t.Fatalf("reason %s", out.String())
 	}
 	if decide(t, "not json") != "deny" {
