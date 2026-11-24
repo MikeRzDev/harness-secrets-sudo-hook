@@ -757,6 +757,31 @@ func TestLocalPasswordCache(t *testing.T) {
 	}
 }
 
+// An account without a password: OK on an empty field is an answer, which is
+// sent to sudo, and cached like any other.
+func TestEmptyPasswordIsSentAndCached(t *testing.T) {
+	forEachTarget(t, func(t *testing.T, f *fixture) {
+		os.WriteFile(filepath.Join(f.state, "password"), nil, 0o600)
+		f.answer = ""
+		if code := f.run("true"); code != 0 {
+			t.Fatalf("exit %d stderr %q", code, f.err.String())
+		}
+	})
+	f := newFixture(t, "")
+	os.WriteFile(filepath.Join(f.state, "password"), nil, 0o600)
+	f.answer = ""
+	store := &memStore{}
+	f.r.Store = func() (cache.Store, error) { return store, nil }
+	for i := 0; i < 2; i++ {
+		if code := f.run("true"); code != 0 {
+			t.Fatalf("run %d exit %d stderr %q", i, code, f.err.String())
+		}
+	}
+	if len(f.asks) != 1 || store.writes != 1 {
+		t.Fatalf("asks=%d writes=%d", len(f.asks), store.writes)
+	}
+}
+
 func TestCacheDisabledAlwaysPrompts(t *testing.T) {
 	f := newFixture(t, "")
 	store := &memStore{record: &cache.Record{Password: secret, CreatedAt: 999, TTLSeconds: 7200}}

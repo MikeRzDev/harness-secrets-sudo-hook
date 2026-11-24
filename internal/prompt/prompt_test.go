@@ -77,14 +77,15 @@ func TestAskOutcomes(t *testing.T) {
 		{"s3cret\n", 0, nil, nil, "s3cret"},
 		{"", 1, nil, ErrCancelled, ""},
 		{"", 5, nil, ErrCancelled, ""}, // zenity timeout
-		{"\n", 0, nil, ErrCancelled, ""},
+		{"\n", 0, nil, nil, ""}, // OK on an empty field
+		{"", 0, nil, nil, ""},
 		{"a\nb\n", 0, nil, ErrCancelled, ""},
 		{"", -1, errors.New("not found"), ErrNoProvider, ""},
 	} {
 		e := env("darwin", "", "", "")
 		e.Run = func(context.Context, string, []string) ([]byte, int, error) { return []byte(tc.out), tc.code, tc.err }
 		pw, err := e.Ask(context.Background(), Request{Title: "t", Command: "c"})
-		if !errors.Is(err, tc.want) || string(pw) != tc.pw {
+		if !errors.Is(err, tc.want) || string(pw) != tc.pw || (err == nil && pw == nil) {
 			t.Errorf("%+v: got %q %v", tc, pw, err)
 		}
 	}

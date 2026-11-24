@@ -24,7 +24,8 @@ import (
 var (
 	// ErrNoProvider means no dialog can be shown here (for example, no display).
 	ErrNoProvider = errors.New("no password dialog is available")
-	// ErrCancelled means the user cancelled, the dialog timed out, or the input was unusable.
+	// ErrCancelled means the user cancelled, the dialog timed out, or the input
+	// was unusable. An empty field confirmed with OK is an answer, not a cancel.
 	ErrCancelled = errors.New("password dialog cancelled or timed out")
 )
 
@@ -173,9 +174,15 @@ func (e Env) Ask(ctx context.Context, req Request) ([]byte, error) {
 	if code != 0 || ctx.Err() != nil {
 		return nil, ErrCancelled
 	}
+	// The exit code alone tells a cancel from an answer: OK on an empty field
+	// is an empty answer (an account or secret without a password), returned
+	// as a non-nil empty slice so callers can tell it from "not asked yet".
 	password := bytes.TrimSuffix(out, []byte("\n"))
-	if len(password) == 0 || bytes.ContainsAny(password, "\n\r\x00") {
+	if bytes.ContainsAny(password, "\n\r\x00") {
 		return nil, ErrCancelled
+	}
+	if password == nil {
+		password = []byte{}
 	}
 	return password, nil
 }

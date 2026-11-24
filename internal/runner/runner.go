@@ -284,7 +284,8 @@ func (r *Runner) Run(ctx context.Context, host string, argv []string) int {
 				r.fail("could not read the OS credential store")
 				return ExitNoProvider
 			}
-			if rec != nil && rec.Password != "" && cache.Fresh(rec.Meta(), ttl, now) {
+			// An empty password is a real one (an account without a password).
+			if rec != nil && cache.Fresh(rec.Meta(), ttl, now) {
 				password, fromCache = []byte(rec.Password), true
 			}
 		}
@@ -296,7 +297,7 @@ func (r *Runner) Run(ctx context.Context, host string, argv []string) int {
 		}
 	}
 
-	if password == nil {
+	if !fromCache {
 		pw, err := r.Ask(ctx, prompt.Request{Title: r.Title, Host: host, Command: shquote.Visible(shquote.Join(argv)),
 			Timeout: prompt.DefaultTimeout})
 		switch {
