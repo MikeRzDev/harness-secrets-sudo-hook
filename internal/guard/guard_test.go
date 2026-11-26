@@ -523,6 +523,22 @@ func TestParserDifferentials(t *testing.T) {
 		`X='ls'; X="$Y"; sh -c "$X"`:                              "deny",
 		`export X='ls'; eval "$X"`:                                "allow",
 		`X='sudo id'; eval '$X'`:                                  "deny",
+		`X='ls'; sh -c "${X}"`:                                    "allow",
+
+		// Only plain assignments are followed. A variable set any other way
+		// after a literal one is unknown, so the code it holds is computed.
+		`X=true; read X; sh -c "$X"`:                "deny",
+		`X=true; read X; eval "$X"`:                 "deny",
+		`X=true; printf -v X '%s' "$Y"; sh -c "$X"`: "deny",
+		`X=true; declare -n X=Y; sh -c "$X"`:        "deny",
+		`X=true; local -n X=Y; sh -c "$X"`:          "deny",
+		`X=true; declare -i X=1; sh -c "$X"`:        "deny",
+		`X=true; let X=1; sh -c "$X"`:               "deny",
+		`X=true; getopts a X; sh -c "$X"`:           "deny",
+		`X=true; mapfile -t X < f; sh -c "$X"`:      "deny",
+		`X=true; for X in a b; do sh -c "$X"; done`: "deny",
+		`X=true; (( X = 1 )); sh -c "$X"`:           "deny",
+		`X=true; IFS= read -r X < f; ssh host "$X"`: "allow",
 
 		// Found by the same replay: case patterns and env assignments.
 		`for f in *; do case "$f" in *.md|*.txt|config*) echo "$f";; *) ;; esac; done`: "allow",

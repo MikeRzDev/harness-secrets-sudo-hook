@@ -420,7 +420,7 @@ func TestLongTextFitsTheDialog(t *testing.T) {
 	}
 	shown := strings.Split(d.Text, "\n")
 	hidden := len(lines) - (len(shown) - 1)
-	if !strings.Contains(d.Text, fmt.Sprintf("[… %d more lines not shown …]", hidden)) {
+	if !strings.Contains(d.Text, fmt.Sprintf(hiddenLines, hidden)) {
 		t.Fatalf("want a marker for %d hidden lines:\n%s", hidden, d.Text)
 	}
 

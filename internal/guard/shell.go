@@ -6,6 +6,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -77,10 +78,41 @@ type pipeline struct{ cmds []*simpleCmd }
 // scope holds the values this command assigns to variables, as written:
 // CMD='qm list' lets ssh host "$CMD" be judged by what it runs. A variable
 // that is ever given a computed value is unknown.
+//
+// Only plain assignments are modelled. So a variable is known only when its
+// name appears in the command as those assignments and as exact $NAME or
+// ${NAME} reads, nowhere else: read NAME, printf -v NAME, for NAME in,
+// getopts, let, (( )) and the like set it in ways the guard does not follow.
 type scope struct {
+	src     string // the whole command, to find every mention of a name
 	lits    map[string][]string
 	unknown map[string]bool
 }
+
+// mentions counts the places src names the variable name other than as an
+// exact $NAME or ${NAME} read.
+func mentions(src, name string) int {
+	n := 0
+	for _, m := range identifier.FindAllStringIndex(src, -1) {
+		if src[m[0]:m[1]] != name {
+			continue
+		}
+		before := byte(0)
+		if m[0] > 0 {
+			before = src[m[0]-1]
+		}
+		if before == '$' {
+			continue
+		}
+		if before == '{' && m[0] > 1 && src[m[0]-2] == '$' && m[1] < len(src) && src[m[1]] == '}' {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+var identifier = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
 
 // literal returns the values a word that is exactly $NAME or ${NAME},
 // expanded here, can have: those assigned to NAME in this command. It
@@ -94,6 +126,10 @@ func (sc *scope) literal(w word) []string {
 		name = name[1 : len(name)-1]
 	}
 	if name == w.text || varName.FindString(name) != name || sc.unknown[name] {
+		return nil
+	}
+	// Each literal assignment is one mention; any other one may set it.
+	if mentions(sc.src, name) != len(sc.lits[name]) {
 		return nil
 	}
 	return sc.lits[name]
@@ -365,7 +401,7 @@ func (p *parser) endPipe() {
 func (p *parser) current() *simpleCmd {
 	if p.cmd == nil {
 		if p.scope == nil {
-			p.scope = &scope{lits: map[string][]string{}, unknown: map[string]bool{}}
+			p.scope = &scope{src: p.src, lits: map[string][]string{}, unknown: map[string]bool{}}
 		}
 		p.cmd = &simpleCmd{start: p.tok, scope: p.scope}
 	}
@@ -391,10 +427,22 @@ func (p *parser) collect() {
 			if k >= 0 {
 				switch c.words[k].text {
 				case "export", "local", "declare", "typeset", "readonly":
+					// An option changes what the assignment does (-n makes
+					// a reference, -i evaluates the value): its names are
+					// unknown.
+					opts := slices.ContainsFunc(c.words[k+1:], func(w word) bool {
+						return strings.HasPrefix(w.text, "-") || strings.HasPrefix(w.text, "+")
+					})
 					for _, w := range c.words[k+1:] {
-						if assignment.MatchString(w.text) {
-							c.scope.record(w)
+						if !assignment.MatchString(w.text) {
+							continue
 						}
+						if opts || w.dynamic {
+							name, _, _ := strings.Cut(w.text, "=")
+							c.scope.unknown[strings.TrimSuffix(name, "+")] = true
+							continue
+						}
+						c.scope.record(w)
 					}
 				}
 			}

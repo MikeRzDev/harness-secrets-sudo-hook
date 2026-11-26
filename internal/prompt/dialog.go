@@ -79,6 +79,11 @@ const (
 	textCols = 50
 )
 
+// hiddenLines marks the lines fitText leaves out. They are part of what the
+// user is asked about (they run too), and the whole text is in the agent's
+// tool call.
+const hiddenLines = "[… %d more lines not shown here. They are part of it too; the whole command is in the agent's tool call …]"
+
 // lineRows is the most rows one line of a shortened text takes at first.
 const lineRows = 4
 
@@ -124,7 +129,7 @@ func fitText(s string) string {
 	for i, l := range lines {
 		lines[i] = cutLine(l, lineRows)
 	}
-	budget := textRows - 1 // one row for the marker
+	budget := textRows - rows(fmt.Sprintf(hiddenLines, 99999)) // the marker's rows
 	tailRows := budget / 3
 	tail := len(lines)
 	for tail > 0 && rows(lines[tail-1]) <= tailRows {
@@ -145,7 +150,7 @@ func fitText(s string) string {
 		break
 	}
 	if n := tail - len(head); n > 0 {
-		head = append(head, fmt.Sprintf("[… %d more lines not shown …]", n))
+		head = append(head, fmt.Sprintf(hiddenLines, n))
 	}
 	return strings.Join(append(head, lines[tail:]...), "\n")
 }
