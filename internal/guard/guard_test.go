@@ -162,6 +162,39 @@ func TestDecisionMatrix(t *testing.T) {
 	}
 }
 
+// A computed program name is denied with its own reason, which asks for the
+// name to be written out; sudo anywhere in the command keeps the sudo reason.
+func TestComputedProgramNameReason(t *testing.T) {
+	reason := func(command string) string {
+		var out bytes.Buffer
+		if err := ClaudeCode(strings.NewReader(bash(command)), &out, "/home/u/.claude/hooks/psudo"); err != nil {
+			t.Fatal(err)
+		}
+		var res struct{ HookSpecificOutput map[string]any }
+		json.Unmarshal(out.Bytes(), &res)
+		r, _ := res.HookSpecificOutput["permissionDecisionReason"].(string)
+		return r
+	}
+	for _, command := range []string{
+		`S="ssh -i /k root@192.168.8.234"; $S 'qm list'`,
+		`P=/home/u/.claude/hooks/psudo; $P -H host id -u`,
+		"$EDITOR notes.md",
+	} {
+		if got := reason(command); got != DynamicReason {
+			t.Errorf("%q: reason %q, want the computed-name reason", command, got)
+		}
+	}
+	for _, command := range []string{"${SUDO:-sudo} id", `$'\x73udo' id`, "$S x; sudo -k"} {
+		if got := reason(command); got == DynamicReason || got == "" {
+			t.Errorf("%q: reason %q, want the sudo reason", command, got)
+		}
+	}
+	// Written out, the same root login is not the guard's business.
+	if got := decide(t, bash(`ssh -i /k root@192.168.8.234 'qm list; pct list'`)); got != "allow" {
+		t.Errorf("literal ssh root@host: %s, want allow", got)
+	}
+}
+
 func TestPasswordCacheReadsAreDenied(t *testing.T) {
 	for command, want := range map[string]string{
 		"security find-generic-password -w -s harness-root-hook.claude-code": "deny",

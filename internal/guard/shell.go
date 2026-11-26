@@ -20,6 +20,11 @@ type verdict int
 
 const (
 	allow verdict = iota
+	// denyDynamic is a program name the guard cannot read ($cmd, ${x}),
+	// with nothing else in the command that runs sudo. It is denied like
+	// sudo, but with its own reason: the fix is to write the name out, and
+	// the sudo reason made models believe the command itself was forbidden.
+	denyDynamic
 	denyRoot
 	denyCache
 )
@@ -736,10 +741,13 @@ func (c *simpleCmd) verdict(full, self string) (verdict, bool) {
 				}
 			}
 			return allow, false
-		case cw.dynamic || cw.opaque:
-			// The program is computed ($cmd, ${x:-…}, $'\x..'): it cannot be
-			// judged, so deny.
+		case cw.opaque || cw.dynamic && textVerdict(cw.text) != allow:
+			// $'\x..' cannot be read at all, and ${SUDO:-sudo} names sudo.
 			return denyRoot, true
+		case cw.dynamic:
+			// The program is computed ($cmd, ${x:-…}): it cannot be judged,
+			// so deny, asking for the name to be written out.
+			return denyDynamic, true
 		case cacheTools[name]:
 			if credentialRead(name, c.words[k+1:]) {
 				return denyCache, false

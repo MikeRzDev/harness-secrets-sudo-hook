@@ -32,6 +32,15 @@ func Reason(psudo string) string {
 		"write that text with the file editing tool instead."
 }
 
+// DynamicReason is shown when the only problem is a program name the guard
+// cannot read. It says what was wrong and that the command itself, ssh as
+// root included, is fine once the name is written out.
+const DynamicReason = "Not run: the program name in this command is computed (for example $S or ${cmd}), so psudo's " +
+	"guard cannot see what would run, and it refuses whatever it cannot check for sudo. Nothing else in the " +
+	"command was the problem. Run it again with the program's name or path written out literally in each command " +
+	"(ssh -i key root@host '...', /path/to/psudo -H host ...), not taken from a variable. Variables in the " +
+	"arguments are fine."
+
 // Converted is the note added for the model when its command was converted.
 func Converted(command string) string {
 	return "psudo's guard converted this command's sudo to psudo, which runs it as root and shows the user its own " +
@@ -119,6 +128,8 @@ func ClaudeCode(in io.Reader, out io.Writer, psudo string) error {
 			return convert(out, event.PermissionMode, whole, converted)
 		}
 		return deny(out, psudo)
+	case denyDynamic:
+		return denyWith(out, DynamicReason)
 	case denyCache:
 		return denyWith(out, CacheReason)
 	}
@@ -126,19 +137,24 @@ func ClaudeCode(in io.Reader, out io.Writer, psudo string) error {
 }
 
 // SessionContext is the SessionStart guidance that introduces psudo. The
-// model learns about remote hosts here: the PreToolUse guard only sees
-// commands that contain sudo, not "ssh root@host".
+// model learns about remote hosts here. Logging in as root with a key is
+// allowed: the guard does not deny it, and psudo runs such a command without
+// sudo, so the guidance must not steer the model away from it.
 func SessionContext(psudo string, codex bool) string {
 	p := shquote.Quote(psudo)
 	s := "For authorized commands that need root, on this computer or on SSH hosts, use psudo: run " +
 		p + " <command> [args...] on this computer, or " + p + " -H <ssh-host> <command> [args...] on a host reached over SSH. " +
-		"For root on a remote host use psudo -H, not ssh root@<host>, ssh <host> sudo ..., sudo -S, or sshpass. " +
+		"For root on a remote host use psudo -H, not ssh <host> sudo ..., sudo -S, or sshpass. " +
+		"A host you log in to as root needs no sudo: psudo -H root@<host> runs the command directly with no dialog, " +
+		"and plain ssh root@<host> with a key is fine too. " +
 		"The arguments are passed through exactly; use " + p + " sh -c '...' for pipelines; psudo takes no sudo options. " +
 		"psudo shows the user a native dialog naming the host and command for the sudo password, and, if the host " +
 		"needs a code or password to log in over SSH, a dialog for that too. Never ask the user for a password or " +
 		"code in chat, and never pipe one into a command. Keep the actual command visible in the tool call. " +
 		"Exit 251: the user cancelled; stop that privileged action. 252: authentication failed (the psudo: line says " +
 		"WRONG PASSWORD, NOT PERMITTED or AUTHENTICATION FAILED); report it and do not retry another way. " +
+		"Exit 252 with NO SUDO means the host has no sudo and the account psudo logged in as is not root: if root " +
+		"may log in to that host, run it again with -H root@<host>. " +
 		"255: the SSH connection or login failed. The command's stdin is closed; a command that needs a terminal " +
 		"must be run by the user. " +
 		"For a command that needs a stored secret (an API token, a database password), run " + p +
