@@ -39,7 +39,8 @@ const DynamicReason = "Not run: the program name in this command is computed (fo
 	"guard cannot see what would run, and it refuses whatever it cannot check for sudo. Nothing else in the " +
 	"command was the problem. Run it again with the program's name or path written out literally in each command " +
 	"(ssh -i key root@host '...', /path/to/psudo -H host ...), not taken from a variable. Variables in the " +
-	"arguments are fine."
+	"arguments are fine, and so is a variable folder in double quotes before a written-out name " +
+	"(./\"$h\"/fleet-ssh, \"$HOME\"/bin/tool)."
 
 // Converted is the note added for the model when its command was converted.
 func Converted(command string) string {

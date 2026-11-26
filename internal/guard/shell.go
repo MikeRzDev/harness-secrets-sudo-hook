@@ -669,6 +669,67 @@ func (p *parser) expansion(b *strings.Builder, w *word) {
 
 func base(s string) string { return path.Base(s) }
 
+// programName is a plain file name: what a path must end in for the guard
+// to know the program when only its folder is computed.
+var programName = regexp.MustCompile(`^[A-Za-z0-9._+-]+$`)
+
+// literalProgram reports whether a computed program word, as written in the
+// source (raw, quotes included), names its program literally with only the
+// folder computed: "$h"/fleet-ssh, "${HOME}"/bin/tool.
+//
+// Every expansion must be inside double quotes. Unquoted, the shell splits
+// and globs its value, so $h/fleet-ssh with h='sudo id; ' runs sudo. Only
+// $name and ${…} holding plain text are accepted: $(…), backticks and nested
+// expansions are refused rather than parsed. The last / must follow every
+// expansion, so "${p:-/bin/sh}" (which runs $p) does not count.
+func literalProgram(raw string) bool {
+	i := strings.LastIndexByte(raw, '/')
+	if i < 0 || !programName.MatchString(raw[i+1:]) {
+		return false
+	}
+	s := raw[:i]
+	inDQ := false
+	for k := 0; k < len(s); k++ {
+		switch s[k] {
+		case '\\':
+			k++
+		case '\'':
+			if !inDQ {
+				end := strings.IndexByte(s[k+1:], '\'')
+				if end < 0 {
+					return false
+				}
+				k += end + 1
+			}
+		case '"':
+			inDQ = !inDQ
+		case '`':
+			return false
+		case '*', '?', '[':
+			if !inDQ {
+				return false
+			}
+		case '$':
+			if !inDQ || k+1 >= len(s) {
+				return false
+			}
+			switch {
+			case s[k+1] == '{':
+				end := strings.IndexByte(s[k+2:], '}')
+				if end < 0 || strings.ContainsAny(s[k+2:k+2+end], "\"'$`\\{(") {
+					return false
+				}
+				k += end + 2
+			case s[k+1] == '_' || s[k+1] >= 'A' && s[k+1] <= 'Z' || s[k+1] >= 'a' && s[k+1] <= 'z':
+				// $name: the name ends at the first character that cannot be in one.
+			default:
+				return false
+			}
+		}
+	}
+	return !inDQ
+}
+
 // commandWord returns the index of the program a simple command runs,
 // skipping assignments and reserved words, or -1.
 func commandWord(words []word, from int) int {
@@ -744,9 +805,10 @@ func (c *simpleCmd) verdict(full, self string) (verdict, bool) {
 		case cw.opaque || cw.dynamic && textVerdict(cw.text) != allow:
 			// $'\x..' cannot be read at all, and ${SUDO:-sudo} names sudo.
 			return denyRoot, true
-		case cw.dynamic:
+		case cw.dynamic && (cw.end > len(full) || !literalProgram(full[cw.start:cw.end])):
 			// The program is computed ($cmd, ${x:-…}): it cannot be judged,
-			// so deny, asking for the name to be written out.
+			// so deny, asking for the name to be written out. When only its
+			// folder is computed, name is the program, judged below.
 			return denyDynamic, true
 		case cacheTools[name]:
 			if credentialRead(name, c.words[k+1:]) {

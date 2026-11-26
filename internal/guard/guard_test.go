@@ -189,6 +189,40 @@ func TestComputedProgramNameReason(t *testing.T) {
 			t.Errorf("%q: reason %q, want the sudo reason", command, got)
 		}
 	}
+	// Only the folder computed, in double quotes: the program is known, and
+	// judged by its name. Unquoted, the shell splits and globs the value, so
+	// the program could be anything.
+	for command, want := range map[string]string{
+		`for h in bohr maxwell; do ./"$h"/fleet-ssh 'qm list'; done`: "allow",
+		`"$dir"/fleet-ssh 'qm list'`:                                 "allow",
+		`"${HOME}"/bin/tool --flag`:                                  "allow",
+		`"$HOME/bin"/tool --flag`:                                    "allow",
+		`'/opt/my dir'/"$v"/tool x`:                                  "allow",
+		"for h in bohr maxwell; do ./$h/fleet-ssh 'qm list'; done":   "deny",
+		"${HOME}/bin/tool --flag":                                    "deny",
+		`h=$(printf '\163udo id; '); $h/fleet-ssh x`:                 "deny",
+		`"$(pick)"/tool x`:                                           "deny",
+		`"${x:-$(pick)}"/tool x`:                                     "deny",
+		`"$@"/tool x`:                                                "deny",
+		`"$h/"tool x`:                                                "deny",
+		`"$h"/*/tool x`:                                              "deny",
+		"$d/sudo id":                                                 "deny",
+		"$d/sshpass -p x ssh h":                                      "deny",
+		"$d/env sudo id":                                             "deny",
+		"$d/sh -c 'sudo id'":                                         "deny",
+		"$d/fleet-ssh 'sudo id'":                                     "deny",
+		"$d/security find-generic-password -w -s x":                  "deny",
+		"$(sudo id)/fleet-ssh x":                                     "deny",
+		"${p:-/bin/sh} -c x":                                         "deny",
+		"$(echo a/b) x":                                              "deny",
+		"`pick`/tool x":                                              "deny",
+		"$d/$prog x":                                                 "deny",
+		"$d/${x}tool":                                                "deny",
+	} {
+		if got := verdictOf(command); got != want {
+			t.Errorf("%q: %s, want %s", command, got, want)
+		}
+	}
 	// Written out, the same root login is not the guard's business.
 	if got := decide(t, bash(`ssh -i /k root@192.168.8.234 'qm list; pct list'`)); got != "allow" {
 		t.Errorf("literal ssh root@host: %s, want allow", got)
