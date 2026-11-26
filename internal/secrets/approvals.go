@@ -83,14 +83,56 @@ func RulesHash(p Policy) string {
 
 const rulesEntry = "rules"
 
-// RulesApproved reports whether the user approved exactly these rules.
-func (a *Approvals) RulesApproved(hash string) (bool, error) {
-	data, err := a.Vault.Get(rulesEntry)
-	if err != nil {
-		return false, err
-	}
-	return data != nil && string(data) == hash, nil
+// approvedRules is what the rules entry holds: the hash of the whole policy
+// the user approved, and the hash of each of its rules, so that the next
+// approval dialog can show only the rules that changed. An entry written by
+// an older psudo holds only the policy hash, in hex.
+type approvedRules struct {
+	Hash  string            `json:"hash"`
+	Rules map[string]string `json:"rules"`
 }
 
-// ApproveRules records the user's approval of the rules with this hash.
-func (a *Approvals) ApproveRules(hash string) error { return a.Vault.Put(rulesEntry, []byte(hash)) }
+// ruleHash is the SHA-256 of one rule.
+func ruleHash(r Rule) string {
+	data, _ := json.Marshal(r)
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func (a *Approvals) approved() (approvedRules, error) {
+	data, err := a.Vault.Get(rulesEntry)
+	if err != nil || data == nil {
+		return approvedRules{}, err
+	}
+	var ar approvedRules
+	if json.Unmarshal(data, &ar) != nil || ar.Hash == "" {
+		return approvedRules{Hash: string(data)}, nil // an older entry
+	}
+	return ar, nil
+}
+
+// RulesApproved reports whether the user approved exactly these rules.
+func (a *Approvals) RulesApproved(hash string) (bool, error) {
+	ar, err := a.approved()
+	return err == nil && ar.Hash != "" && ar.Hash == hash, err
+}
+
+// ApprovedRules returns the hash of each rule the user approved last, or nil
+// when psudo does not know them (nothing approved yet, or an older entry).
+func (a *Approvals) ApprovedRules() (map[string]string, error) {
+	ar, err := a.approved()
+	return ar.Rules, err
+}
+
+// ApproveRules records the user's approval of these rules.
+func (a *Approvals) ApproveRules(p Policy) error {
+	ar := approvedRules{Hash: RulesHash(p), Rules: map[string]string{}}
+	for name, rule := range p {
+		ar.Rules[name] = ruleHash(rule)
+	}
+	data, err := json.Marshal(ar)
+	if err != nil {
+		return err
+	}
+	return a.Vault.Put(rulesEntry, data)
+}

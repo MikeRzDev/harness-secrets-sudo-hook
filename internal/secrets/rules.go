@@ -139,8 +139,10 @@ func ruleNote(path, name string, r Rule) string {
 	if path == "" {
 		path = "config.json"
 	}
-	note := "This also adds a rule to " + shquote.VisibleLine(path) + ": " + strings.Join(r.Commands, ", ") +
-		" may use \"" + name + "\" as " + strings.Join(r.Vars, ", ") + " " + where + ". "
+	// The rule gets lines of its own, so a long program path cannot push the
+	// rest of it out of a dialog that is shortened to fit.
+	note := "This also adds a rule to " + shquote.VisibleLine(path) + ":\n" + strings.Join(r.Commands, ", ") +
+		"\nmay use \"" + name + "\" as " + strings.Join(r.Vars, ", ") + " " + where + ".\n"
 	if r.Confirm {
 		return note + "This program runs whatever code it is given, so psudo asks before each use and shows the command. " +
 			"Any other program or variable is refused."

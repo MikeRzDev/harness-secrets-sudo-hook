@@ -298,7 +298,7 @@ func (r *Runner) Run(ctx context.Context, req Request) int {
 			r.fail("could not add the rule to config.json (%v). The command was not run.", err)
 			return ExitStore
 		}
-		if err := approvals.ApproveRules(RulesHash(merge(policy, newRules))); err != nil {
+		if err := approvals.ApproveRules(merge(policy, newRules)); err != nil {
 			r.fail("could not record the approved rules. The command was not run.")
 			return ExitStore
 		}
@@ -506,10 +506,36 @@ func (r *Runner) keep(ctx context.Context, st *stores, name string, value []byte
 }
 
 // RulesMessage is the dialog body that asks the user to approve rules.
-func RulesMessage(path string, p Policy) string {
+// approved holds the hash of each rule the user approved last; with it, the
+// dialog shows only the rules that are new or changed and names the removed
+// ones, so what is being approved fits in the dialog. Without it (nil), it
+// shows every rule.
+func RulesMessage(path string, p Policy, approved map[string]string) string {
 	var b strings.Builder
 	b.WriteString("The secret rules in " + shquote.VisibleLine(path) + " are new or have changed. psudo uses them only after you approve them.\n")
-	for _, name := range sortedNames(p) {
+	names := sortedNames(p)
+	var shown, removed []string
+	label := map[string]string{}
+	for _, name := range names {
+		switch h, ok := approved[name]; {
+		case approved == nil:
+			shown = append(shown, name)
+		case !ok:
+			shown, label[name] = append(shown, name), " (new)"
+		case h != ruleHash(p[name]):
+			shown, label[name] = append(shown, name), " (changed)"
+		}
+	}
+	for name := range approved {
+		if _, ok := p[name]; !ok {
+			removed = append(removed, name)
+		}
+	}
+	sort.Strings(removed)
+	if approved != nil && len(shown) == 0 && len(removed) == 0 {
+		shown = names // nothing differs rule by rule: show them all
+	}
+	for _, name := range shown {
 		rule := p[name]
 		var hosts []string
 		if rule.Local {
@@ -532,8 +558,16 @@ func RulesMessage(path string, p Policy) string {
 		if vars == "" {
 			vars, _ = envfile.Key(name)
 		}
-		fmt.Fprintf(&b, "\n%s\n  commands: %s\n  as: %s\n  hosts: %s\n  %s\n", name, strings.Join(rule.Commands, ", "),
-			vars, strings.Join(hosts, ", "), ask)
+		fmt.Fprintf(&b, "\n%s%s\n  commands: %s\n  as: %s\n  hosts: %s\n  %s\n", name, label[name],
+			strings.Join(rule.Commands, ", "), vars, strings.Join(hosts, ", "), ask)
+	}
+	if len(removed) > 0 {
+		fmt.Fprintf(&b, "\nRemoved: %s\n", strings.Join(removed, ", "))
+	}
+	if n := len(names) - len(shown); n == 1 {
+		b.WriteString("\n1 other rule is unchanged.\n")
+	} else if n > 1 {
+		fmt.Fprintf(&b, "\n%d other rules are unchanged.\n", n)
 	}
 	return b.String()
 }
@@ -578,13 +612,18 @@ func (r *Runner) approveRules(ctx context.Context, a *Approvals, p Policy) (int,
 	if ok {
 		return 0, true
 	}
+	before, err := a.ApprovedRules()
+	if err != nil {
+		r.fail("could not read the OS credential store. The command was not run.")
+		return ExitStore, false
+	}
 	_, code, ok := r.ask(ctx, prompt.Choice{Title: strings.Replace(r.Title, "Secret request", "Secret rules changed", 1),
-		Text: RulesMessage(r.ConfigPath, p), Buttons: []string{"Deny", "Approve rules"}},
+		Text: RulesMessage(r.ConfigPath, p, before), Buttons: []string{"Deny", "Approve rules"}},
 		"the user did not approve the changed secret rules (or the dialog timed out).")
 	if !ok {
 		return code, false
 	}
-	if err := a.ApproveRules(hash); err != nil {
+	if err := a.ApproveRules(p); err != nil {
 		r.fail("could not record the approved rules. The command was not run.")
 		return ExitStore, false
 	}

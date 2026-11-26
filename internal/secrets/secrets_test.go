@@ -489,10 +489,13 @@ func TestRulesApproval(t *testing.T) {
 		t.Fatalf("rules stay approved: %d %d", code, len(f.chosen))
 	}
 	// An edit to the file (for example confirm:false) needs approval again.
+	// The dialog shows only the rule that changed, so it fits.
 	f.policy = strings.Replace(f.policy, `"confirm":true,"remember_seconds":600`, `"confirm":false`, 1)
 	f.answer = nil
-	if code := f.run(tokReq(f)); code != runner.ExitCancelled || !strings.Contains(f.chosen[0].Text, "get it without a dialog") ||
-		!strings.Contains(f.chosen[0].Text, "asks before each use") {
+	if code := f.run(tokReq(f)); code != runner.ExitCancelled || !strings.Contains(f.chosen[0].Text, "tok (changed)") ||
+		!strings.Contains(f.chosen[0].Text, "get it without a dialog") ||
+		strings.Contains(f.chosen[0].Text, "asks before each use") ||
+		!strings.Contains(f.chosen[0].Text, "1 other rule is unchanged.") {
 		t.Fatalf("changed rules: %d %+v", code, f.chosen)
 	}
 	f.answer = []int{1}
@@ -1321,4 +1324,54 @@ func mustReal(t *testing.T, p string) string {
 		t.Fatal(err)
 	}
 	return r
+}
+
+// The rules dialog lists the new, changed and removed rules, and only counts
+// the unchanged ones. Without a record of each rule (an entry from an older
+// psudo), it lists them all.
+func TestRulesMessageShowsWhatChanged(t *testing.T) {
+	a := &Approvals{Vault: newMem(), Lock: func() (func(), error) { return func() {}, nil }, Now: time.Now}
+	before := Policy{
+		"keep":   {Commands: []string{"/bin/keep"}, Local: true},
+		"edit":   {Commands: []string{"/bin/edit"}, Local: true},
+		"remove": {Commands: []string{"/bin/remove"}, Local: true},
+	}
+	if err := a.ApproveRules(before); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := a.RulesApproved(RulesHash(before)); !ok {
+		t.Fatal("approved rules are not approved")
+	}
+	after := Policy{
+		"keep": before["keep"],
+		"edit": {Commands: []string{"/bin/edit", "/bin/other"}, Local: true},
+		"add":  {Commands: []string{"/bin/add"}, Local: true},
+	}
+	approved, err := a.ApprovedRules()
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := RulesMessage("/cfg.json", after, approved)
+	for _, want := range []string{"add (new)", "edit (changed)", "/bin/other", "Removed: remove", "1 other rule is unchanged."} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("missing %q:\n%s", want, msg)
+		}
+	}
+	if strings.Contains(msg, "/bin/keep") {
+		t.Fatalf("an unchanged rule is listed:\n%s", msg)
+	}
+
+	// An entry from an older psudo: just the policy hash.
+	if err := a.Vault.Put(rulesEntry, []byte(RulesHash(after))); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := a.RulesApproved(RulesHash(after)); !ok {
+		t.Fatal("an older entry no longer approves its rules")
+	}
+	if approved, _ := a.ApprovedRules(); approved != nil {
+		t.Fatalf("an older entry has no rule hashes: %v", approved)
+	}
+	if msg := RulesMessage("/cfg.json", after, nil); !strings.Contains(msg, "/bin/keep") || strings.Contains(msg, "unchanged") {
+		t.Fatalf("without a record every rule is listed:\n%s", msg)
+	}
 }
