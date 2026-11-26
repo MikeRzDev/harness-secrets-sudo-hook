@@ -341,6 +341,12 @@ The fix fails closed. A variable is followed only when all of these hold:
 
 A variable that is not followed is judged as computed, and also as each literal value it was given, which can only add refusals. The cost: `X='ls'; eval "$X"` is now refused as computed code. Replaying the 4760 transcript commands against the pushed build changed no decision. Tests are in `TestParserDifferentials`.
 
+A third review found two more gaps, both now closed:
+- **The fallback dropped values.** With more than 16 combinations of values, the words were judged only as written, so twenty extra assignments to a variable got a root command past the guard. The fallback now judges every value on its own as well. Words are joined with spaces, so no command can be spelled across two values.
+- **The list of setters was a denylist.** It missed `set`, `zformat`, `integer`, `private`, `compgen` and others. The check is now inverted. Only a builtin can set a variable of its shell, so every builtin of bash and zsh, plus the zsh module builtins a startup file may load, counts as a possible setter. The exceptions are a few quiet ones (`cd`, `echo`, `test`, `pwd`, `exit` …), whose side effects are only names that are never followed (PWD, DIRSTACK).
+
+Replaying 4779 transcript commands against the build before this change changed no decision.
+
 ### 5.8 Tests
 
 After the last change, `go vet ./... && go test -count=1 ./...` and `go test -count=1 -tags psudo_testapp ./internal/prompt ./internal/install ./cmd/psudo` pass. `make install-test-app` reinstalled all three copies from one build.

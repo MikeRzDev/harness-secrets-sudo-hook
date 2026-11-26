@@ -554,9 +554,18 @@ func TestParserDifferentials(t *testing.T) {
 		`X=true; f() { read; }; f; sh -c "$X"`:            "deny",
 		// A variable that is not followed is still judged by every literal
 		// value it is given.
-		`CMD='sudo reboot'; printf x; ssh host "$CMD"`:       "deny",
-		`CMD='qm list'; printf x; ssh host "$CMD"`:           "allow",
-		`CMD='sudo reboot'; read CMD; ssh host "$CMD"`:       "deny",
+		`CMD='sudo reboot'; printf x; ssh host "$CMD"`: "deny",
+		`CMD='qm list'; printf x; ssh host "$CMD"`:     "allow",
+		`CMD='sudo reboot'; read CMD; ssh host "$CMD"`: "deny",
+		// Every builtin may set a variable, except a few quiet ones.
+		`X=true; set -A X a; sh -c "$X"`:       "deny",
+		`X=true; zformat -f X a; sh -c "$X"`:   "deny",
+		`X=true; integer X; sh -c "$X"`:        "deny",
+		`X=true; compgen -v -X x; sh -c "$X"`:  "deny",
+		`X='ls'; cd /tmp; echo hi; sh -c "$X"`: "allow",
+		// Too many values: each one is still judged on its own.
+		`C='sudo reboot'; C=v0; C=v1; C=v2; C=v3; C=v4; C=v5; C=v6; C=v7; C=v8; C=v9; C=v10; C=v11; C=v12; C=v13; C=v14; C=v15; C=v16; C=v17; C=v18; C=v19; ssh host "$C" "$C"`: "deny",
+		`C='qm list'; C=v0; C=v1; C=v2; C=v3; C=v4; C=v5; C=v6; C=v7; C=v8; C=v9; C=v10; C=v11; C=v12; C=v13; C=v14; C=v15; C=v16; C=v17; C=v18; C=v19; ssh host "$C" "$C"`:     "allow",
 		`X='cd /tmp && ls'; Y='pwd'; sh -c "$X"; sh -c "$Y"`: "allow",
 		`X=true; IFS= read -r X < f; ssh host "$X"`:          "allow",
 

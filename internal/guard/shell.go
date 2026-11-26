@@ -159,27 +159,42 @@ func (sc *scope) candidates(w word) []string {
 	return nil
 }
 
-// setters are the commands that can set a variable of the shell they run in,
-// or run code there, without the variable's name being written next to them
-// (read sets REPLY, printf -v "$n" a computed one, eval and source anything).
-// precommand words that can run them (command, builtin, noglob) count too.
-var setters = map[string]bool{
-	"read": true, "select": true, "getopts": true, "mapfile": true, "readarray": true,
-	"printf": true, "print": true, "declare": true, "typeset": true, "local": true,
-	"export": true, "readonly": true, "eval": true, "source": true, "let": true,
-	"unset": true, "wait": true, "coproc": true, "command": true, "builtin": true,
-	"enable": true, "noglob": true, "nocorrect": true, "vared": true, "zparseopts": true,
-	"zstyle": true, "sysread": true, "strftime": true, "getln": true, "zmodload": true,
-	"autoload": true, "trap": true, "alias": true, "fc": true, "hash": true, "emulate": true,
+// builtins are the builtins of bash (5) and zsh (5.9, with the modules a
+// startup file may load). Only a builtin can set a variable of the shell it
+// runs in, or run code there; a program it starts cannot.
+var builtins = words(`. : [ alias autoload bg bind bindkey break builtin bye caller cd chdir command
+	compadd comparguments compcall compctl compdescribe compfiles compgen complete compgroups compopt
+	compquote compset comptags comptry compvalues continue coproc declare dirs disable disown echo echotc
+	echoti emulate enable eval exec exit export false fc fg float functions getln getopts hash help history
+	integer jobs kill let limit local log logout mapfile noglob nocorrect popd print printf private pushd
+	pushln pwd r read readarray readonly rehash return sched select set setopt shift shopt source suspend
+	test times trap true ttyctl type typeset ulimit umask unalias unfunction unhash unlimit unset unsetopt
+	vared wait whence where which zcompile zformat zle zmodload zparseopts zregexparse zstyle
+	strftime sysread syswrite zstat stat zselect zsocket ztcp zpty zsystem zgetattr zsetattr zdelattr
+	zlistattr zftp zprof zcurses zgdbmpath ztie zuntie pcre_compile pcre_match pcre_study regex zsh`)
+
+// quietBuiltins set no variable but the ones shellSets lists (cd sets PWD)
+// and run no code.
+var quietBuiltins = words(`: [ test true false echo pwd cd chdir pushd popd dirs exit return break
+	continue shift kill jobs bg fg disown suspend times type whence where which umask ulimit limit
+	unlimit help logout bye echotc echoti ttyctl`)
+
+func words(s string) map[string]bool {
+	m := map[string]bool{}
+	for _, w := range strings.Fields(s) {
+		m[w] = true
+	}
+	return m
 }
 
 // setsUnnamed reports whether src may set a variable whose name it does not
-// write out: a word in setters (anywhere, also inside quotes: a false alarm
-// only means the variable is not followed), the . builtin, or an expansion
-// that assigns or names a variable indirectly.
+// write out: any word that is a builtin other than a quiet one (found
+// anywhere, also inside quotes: a false alarm only means the variable is not
+// followed), the . builtin, or an expansion that assigns or names a
+// variable indirectly.
 func setsUnnamed(src string) bool {
 	for _, m := range identifier.FindAllString(src, -1) {
-		if setters[m] {
+		if builtins[m] && !quietBuiltins[m] {
 			return true
 		}
 	}
@@ -201,7 +216,9 @@ func shellSets(name string) bool {
 		"SRANDOM", "SECONDS", "LINENO", "PIPESTATUS", "pipestatus", "status", "HISTCMD", "EPOCHREALTIME",
 		"EPOCHSECONDS", "COPROC", "match", "MATCH", "mbegin", "mend", "MBEGIN", "MEND", "argv", "ERRNO",
 		"PATH", "path", "FPATH", "fpath", "CDPATH", "cdpath", "MANPATH", "manpath", "IFS", "UID", "EUID",
-		"PPID", "SHLVL", "HOME", "USER", "LOGNAME", "SHELL", "TTY", "PS4", "PROMPT_COMMAND", "TRY_BLOCK_ERROR":
+		"PPID", "SHLVL", "HOME", "USER", "LOGNAME", "SHELL", "TTY", "PS4", "PROMPT_COMMAND", "TRY_BLOCK_ERROR",
+		"DIRSTACK", "dirstack", "COLUMNS", "LINES", "HISTFILE", "OPTERRNO", "aliases", "commands", "functions",
+		"parameters", "options", "history", "jobtexts", "mapfile", "nameddirs", "userdirs", "termcap", "terminfo":
 		return true
 	}
 	return false
@@ -1303,10 +1320,13 @@ type codeText struct {
 // codeOf returns the text words make when joined, once for each value a
 // variable among them can have (scope.literal): CMD='qm list'; ssh h "$CMD"
 // is the code qm list. A variable with no known value stays as written. With
-// too many combinations, nothing is replaced.
+// too many combinations, the words are judged as written and every value on
+// its own: words are joined with spaces, so no command can be spelled across
+// two values, and no value is left unjudged.
 func (c *simpleCmd) codeOf(ws []word) []codeText {
 	out := []codeText{{}}
 	resolved := false
+	var each []codeText // every value of every word, for the fallback
 	for i, w := range ws {
 		texts := []string{w.text}
 		if vals := c.scope.literal(w); len(vals) > 0 {
@@ -1314,6 +1334,11 @@ func (c *simpleCmd) codeOf(ws []word) []codeText {
 		} else if vals := c.scope.candidates(w); len(vals) > 0 {
 			// Not followed: judged as computed, and as each value it was given.
 			texts = append(append([]string{}, vals...), w.text)
+		}
+		if len(texts) > 1 || texts[0] != w.text {
+			for _, t := range texts {
+				each = append(each, codeText{text: t})
+			}
 		}
 		var next []codeText
 		for _, o := range out {
@@ -1325,7 +1350,12 @@ func (c *simpleCmd) codeOf(ws []word) []codeText {
 			}
 		}
 		if len(next) > 16 {
-			return []codeText{{text: joinWords(ws), judged: anyDynamic(ws)}}
+			for _, w := range ws[i+1:] {
+				for _, t := range append(c.scope.literal(w), c.scope.candidates(w)...) {
+					each = append(each, codeText{text: t})
+				}
+			}
+			return append([]codeText{{text: joinWords(ws), judged: anyDynamic(ws)}}, each...)
 		}
 		out = next
 	}
