@@ -297,3 +297,84 @@ func TestRefusesSymlinkTarget(t *testing.T) {
 		t.Fatal("symlink target overwritten")
 	}
 }
+
+// psudo.app is for tests only: the harness installs never create it, so the
+// dialogs come from osascript. --install=test-app creates it (a copy of psudo
+// with an Info.plist that gives it a bundle ID and a Dock icon, signed and
+// registered); --uninstall=test-app, or uninstalling the last harness,
+// removes it.
+func TestPsudoAppIsOnlyForTests(t *testing.T) {
+	f := newFixture(t, "darwin")
+	f.in.AppDir = filepath.Join(t.TempDir(), "Applications")
+	os.MkdirAll(f.in.AppDir, 0o755)
+	app := filepath.Join(f.in.AppDir, AppName)
+	if err := f.in.InstallClaudeCode(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.in.InstallCodex(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(app); !os.IsNotExist(err) {
+		t.Fatal("a harness install created psudo.app: osascript must stay the default")
+	}
+
+	if err := f.in.InstallTestApp(); err != nil {
+		t.Fatal(err)
+	}
+	plist := read(t, filepath.Join(app, "Contents", "Info.plist"))
+	for _, want := range []string{"<string>" + AppBundleID + "</string>", "<key>CFBundleExecutable</key><string>psudo</string>",
+		"<string>APPL</string>"} {
+		if !strings.Contains(plist, want) {
+			t.Errorf("Info.plist lacks %s:\n%s", want, plist)
+		}
+	}
+	if strings.Contains(plist, "LSUIElement") {
+		t.Error("psudo.app must be a regular app: computer use cannot be given an accessory app")
+	}
+	bin := filepath.Join(app, "Contents", "MacOS", "psudo")
+	if info, err := os.Stat(bin); err != nil || info.Mode().Perm() != 0o755 || read(t, bin) != "binary" {
+		t.Fatalf("app binary: %v %v", info, err)
+	}
+	joined := strings.Join(f.calls, "\n")
+	if !strings.Contains(joined, "/usr/bin/codesign --force --sign - "+app) || !strings.Contains(joined, lsregister+" -f "+app) {
+		t.Errorf("app not signed and registered:\n%s", joined)
+	}
+	if err := f.in.UninstallTestApp(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(app); !os.IsNotExist(err) {
+		t.Fatal("--uninstall=test-app left psudo.app")
+	}
+
+	// Left installed, it goes with the last harness.
+	f.in.InstallTestApp()
+	f.in.UninstallClaudeCode()
+	if _, err := os.Stat(app); err != nil {
+		t.Fatal("psudo.app removed while Codex still uses psudo")
+	}
+	f.in.UninstallCodex()
+	if _, err := os.Stat(app); !os.IsNotExist(err) {
+		t.Fatalf("psudo.app left behind: %v", err)
+	}
+
+	// An app psudo did not make is never deleted.
+	other := filepath.Join(app, "Contents")
+	os.MkdirAll(other, 0o755)
+	os.WriteFile(filepath.Join(other, "Info.plist"), []byte("<string>com.example.other</string>"), 0o644)
+	f.in.UninstallTestApp()
+	if _, err := os.Stat(other); err != nil {
+		t.Fatal("deleted an app psudo did not make")
+	}
+}
+
+// Off macOS, or without an AppDir, there is no test app.
+func TestNoTestAppOffMacOS(t *testing.T) {
+	f := newFixture(t, "linux")
+	f.in.AppDir = filepath.Join(t.TempDir(), "Applications")
+	if err := f.in.InstallTestApp(); err == nil {
+		t.Fatal("installed a test app on Linux")
+	}
+	if _, err := os.Stat(filepath.Join(f.in.AppDir, AppName)); !os.IsNotExist(err) || strings.Contains(strings.Join(f.calls, "\n"), "codesign") {
+		t.Fatal("touched AppDir on Linux")
+	}
+}

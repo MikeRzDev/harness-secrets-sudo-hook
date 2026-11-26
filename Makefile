@@ -4,7 +4,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 PLATFORMS := darwin/arm64 darwin/amd64 linux/amd64 linux/arm64
 
-.PHONY: build test dist release formula tap install-claude-code install-codex uninstall-claude-code uninstall-codex clean
+.PHONY: build test dist release formula tap install-claude-code install-codex uninstall-claude-code uninstall-codex install-test-app uninstall-test-app clean
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/psudo ./cmd/psudo
@@ -63,6 +63,22 @@ uninstall-claude-code: build
 
 uninstall-codex: build
 	bin/psudo --uninstall=codex
+
+# macOS, for regression runs only. A test build (tag psudo_testapp, with cgo
+# for AppKit) shows its dialogs through /Applications/psudo.app, which
+# computer use can answer. It replaces the harness copies with the test build
+# and installs the app from the same build; uninstall-test-app removes the app
+# and puts normal builds back. Releases never carry the tag.
+install-test-app:
+	CGO_ENABLED=1 go build -tags psudo_testapp -trimpath -ldflags "$(LDFLAGS)" -o bin/psudo-testapp ./cmd/psudo
+	bin/psudo-testapp --install=claude-code
+	@if [ -d "$${CODEX_HOME:-$$HOME/.codex}/root-hook" ]; then bin/psudo-testapp --install=codex; fi
+	bin/psudo-testapp --install=test-app
+
+uninstall-test-app: build
+	bin/psudo --uninstall=test-app
+	bin/psudo --install=claude-code
+	@if [ -d "$${CODEX_HOME:-$$HOME/.codex}/root-hook" ]; then bin/psudo --install=codex; fi
 
 clean:
 	rm -rf bin dist

@@ -108,6 +108,25 @@ Every failure that originates in `psudo` writes one line to stderr prefixed with
 - Has a timeout shorter than the harness's command timeout; on expiry it behaves as cancel.
 - Backends: native dialog on macOS, a standard password dialog on Linux desktops.
 - Replaceable, so a different provider (for example a phone approval) can be added later without changing the CLI.
+- **One definition, many backends.** Every dialog is defined once, as a backend-neutral `Dialog` in `internal/prompt/dialog.go`. That covers the sudo password, an SSH login prompt, a secret's value, and the approval and "keep the secret?" choices.
+  - A `Dialog` holds its kind, title and text, whether the answer is hidden, the buttons in order, the button Return presses, the button Escape presses (if any) and when it gives up.
+  - The rules live there and only there, for example "the refusal is the default button of a choice and not its cancel button".
+  - Each backend (psudo.app, osascript, zenity, kdialog, ssh-askpass) is a mapper: from the `Dialog` to its program, and from that program's output back to one `Result` (answered, refused, timed out, unavailable).
+  - A test checks that the two macOS mappers carry every field of every dialog psudo shows.
+  - **Long text is shortened, for every backend.** No backend scrolls a dialog's text: osascript, NSAlert, zenity and kdialog grow the window instead, so a long command used to push the password field and the buttons off the screen. A text longer than about 30 rows of 50 characters is shortened in two steps:
+    - First, long lines get shorter, a row at a time, paths and other long words before prose. Each keeps its start and its end with ` … ` in between, so every line, and every statement of the dialog, stays.
+    - If that is not enough (a command of many lines), the text keeps its first lines (the host and the start of the command) and its last lines (the end of the command and what the dialog asks for), with a line `[… N more lines not shown …]` in between. The whole command is still in the harness's tool call.
+  - **An approval shows what it approves.** The "Secret rules changed" dialog lists only the rules that are new or changed since the last approval, names the removed ones and counts the unchanged ones. psudo keeps a hash of each approved rule next to the hash of the whole set; an entry from an older psudo has only the latter, so the first dialog after an upgrade lists every rule.
+  - A rule a secret dialog adds is on lines of its own (the program, then `may use … as … on …`), so a long program path cannot hide the rest of it.
+- **macOS: osascript, and psudo.app for tests.** On macOS the dialogs come from `osascript`. No agent can operate an osascript dialog, because it belongs to no app.
+  - For regression runs only, `make install-test-app` builds a test build (`go build -tags psudo_testapp`, with cgo for AppKit), installs it as the harness copies, and puts `/Applications/psudo.app` in place from the same build, so an agent with computer use can answer psudo's dialogs.
+  - `make uninstall-test-app` removes the app and puts normal builds back. Uninstalling the last harness also removes it.
+  - Only a test build has the app backend, the `--dialog` mode and the AppKit code. A normal build (`make build`, every release) is built without cgo and never asks an app anything, so a `psudo.app` that someone puts in place has no effect.
+  - The app is a copy of psudo with its own bundle ID (`io.github.mikerzdev.psudo`), signed ad hoc and registered with Launch Services.
+  - psudo runs `psudo.app/Contents/MacOS/psudo --dialog`, sends it the `Dialog` as JSON on stdin and reads the `Result` as JSON on stdout. The answer travels only over that pipe.
+  - The helper draws an `NSAlert` with AppKit (cgo) and decides nothing itself. While a dialog is open the app has a Dock icon and becomes the active app: computer use can only be given an app of that kind.
+  - A test build uses the app only while it holds the same build (the same Go build ID), so a stale copy does not answer after a rebuild. Otherwise, and when the app shows nothing (no window server), the same `Dialog` comes from osascript. The build ID check is no defence against a crafted binary; that is what keeping the app out of normal builds is for.
+  - While it is installed, an agent that has been given the "psudo" app in computer use can answer psudo's dialogs, its own approval requests included. That is the point of a test run, and the reason it is not the default.
 
 ### 6.3 Execution sequence on the target
 
@@ -240,4 +259,4 @@ Additional limitations:
 - On a target that keeps no sudo timestamp, the command runs through `/bin/sh` under sudo. sudoers must allow `/bin/sh` there, and sudo's logs show the shell wrapper.
 - Commands that need a terminal (for example a tool that reads a secret with the echo off) or their own stdin cannot run through `psudo`.
 - `psudo` accepts no sudo options. Use `psudo runuser -u <user> -- …` or `psudo sh -c '…'`.
-- A model that can write the user's files can tamper with the installed binary or with the remote user's shell startup files. harness-secrets-sudo-hook keeps the password out of the model's context and off command lines. It is not a defence against a hostile process running as the same user.
+- A model that can write the user's files can tamper with the installed binary (and with both copies of psudo, when the test app is installed), or with the remote user's shell startup files. harness-secrets-sudo-hook keeps the password out of the model's context and off command lines. It is not a defence against a hostile process running as the same user.

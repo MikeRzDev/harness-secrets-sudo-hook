@@ -8,12 +8,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"html"
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MikeRzDev/harness-secrets-sudo-hook/internal/cache"
@@ -72,33 +72,92 @@ func Message(host, command string) string {
 	return "Host: " + label + "\n\nCommand:\n" + command + "\n\nEnter your sudo password on " + label + " to run this command."
 }
 
-// macScript is fixed. Title, message and timeout arrive as argv items.
-const macScript = `on run argv
-activate
-set r to display dialog (item 2 of argv) with title (item 1 of argv) default answer "" with hidden answer with icon caution giving up after ((item 3 of argv) as integer)
-if gave up of r then error number -128
-return text returned of r
-end run`
-
 // Env abstracts the environment so dialog selection is testable.
 type Env struct {
 	GOOS   string
 	Getenv func(string) string
 	Find   func(string) string
-	// Run executes the dialog and returns stdout and the exit code. A non-nil
-	// error means the program could not be started.
-	Run func(ctx context.Context, name string, args []string) ([]byte, int, error)
+	// App is psudo.app's executable on macOS, or "" when it is not installed.
+	App string
+	// Run executes a dialog program with stdin and returns stdout and the exit
+	// code. A non-nil error means the program could not be started.
+	Run func(ctx context.Context, name string, args []string, stdin []byte) ([]byte, int, error)
 }
 
 // System is the production environment.
 func System() Env {
-	return Env{GOOS: runtime.GOOS, Getenv: os.Getenv, Find: sysbin.Find, Run: runDialog}
+	e := Env{GOOS: runtime.GOOS, Getenv: os.Getenv, Find: sysbin.Find, Run: runDialog}
+	if TestApp && e.GOOS == "darwin" && appIsThisBuild() {
+		e.App = AppExecutable
+	}
+	return e
 }
 
-func runDialog(ctx context.Context, name string, args []string) ([]byte, int, error) {
+// AppBundle is the test app (psudo --install=test-app). It shows psudo's
+// dialogs on macOS as an app of its own, so tools that work with apps
+// (computer use) can answer them during a regression run. Without it, the
+// default, the dialogs come from osascript.
+const AppBundle = "/Applications/psudo.app"
+
+// appIsThisBuild reports whether the test app holds the same build as the
+// running test build: the same Go build ID (the ad hoc signature makes the
+// bytes differ). It keeps a stale copy from answering after a rebuild. It is
+// no defence against a crafted binary, which can carry any build ID; that is
+// why only a test build (TestApp) looks at the app at all.
+var appIsThisBuild = sync.OnceValue(func() bool {
+	self, err := os.Executable()
+	return err == nil && sameBuild(self, AppExecutable)
+})
+
+// sameBuild reports whether app is an executable file with the Go build ID
+// of self.
+func sameBuild(self, app string) bool {
+	info, err := os.Stat(app)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&0o111 == 0 {
+		return false
+	}
+	mine, err := goBuildID(self)
+	if err != nil {
+		return false
+	}
+	id, err := goBuildID(app)
+	return err == nil && id == mine
+}
+
+// goBuildID reads the Go build ID from the start of a binary, where the Go
+// linker puts it (go tool buildid reads it the same way).
+func goBuildID(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	head := make([]byte, 32<<10)
+	n, _ := io.ReadFull(f, head)
+	head = head[:n]
+	const start, end = "\xff Go build ID: \"", "\"\n \xff"
+	i := bytes.Index(head, []byte(start))
+	if i < 0 {
+		return "", errors.New("no Go build ID")
+	}
+	rest := head[i+len(start):]
+	j := bytes.Index(rest, []byte(end))
+	if j <= 0 {
+		return "", errors.New("no Go build ID")
+	}
+	return string(rest[:j]), nil
+}
+
+// AppExecutable is the psudo binary inside AppBundle.
+const AppExecutable = AppBundle + "/Contents/MacOS/psudo"
+
+func runDialog(ctx context.Context, name string, args []string, stdin []byte) ([]byte, int, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	// The dialog program gets the account's own HOME, not the caller's.
 	cmd.Env = cache.HelperEnv(os.Environ())
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
 	var out, errOut bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errOut
@@ -108,7 +167,7 @@ func runDialog(ctx context.Context, name string, args []string) ([]byte, int, er
 		// osascript reports a click on the cancel button as error -128. Any
 		// other error means no dialog was shown, which must not read as a
 		// refusal by the user.
-		if name == "/usr/bin/osascript" && ctx.Err() == nil && !strings.Contains(errOut.String(), "(-128)") {
+		if name == osascript && ctx.Err() == nil && !strings.Contains(errOut.String(), "(-128)") {
 			return nil, -1, fmt.Errorf("osascript: %s", strings.TrimSpace(errOut.String()))
 		}
 		return out.Bytes(), exitErr.ExitCode(), nil
@@ -119,72 +178,40 @@ func runDialog(ctx context.Context, name string, args []string) ([]byte, int, er
 	return out.Bytes(), 0, nil
 }
 
-// pangoEscape escapes text for GTK markup labels (zenity --text).
-func pangoEscape(s string) string {
-	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&apos;").Replace(s)
-}
-
-// Command picks the dialog program and its argument vector.
-func (e Env) Command(req Request) (string, []string, error) {
-	msg := req.message()
-	seconds := int(req.Timeout / time.Second)
-	if seconds <= 0 {
-		seconds = int(DefaultTimeout / time.Second)
+// show draws d with the first backend that can, and returns its Result.
+func (e Env) show(ctx context.Context, d Dialog) (Result, error) {
+	if err := d.check(); err != nil {
+		return Result{}, err
 	}
-	switch e.GOOS {
-	case "darwin":
-		return "/usr/bin/osascript", []string{"-e", macScript, req.Title, msg, strconv.Itoa(seconds)}, nil
-	case "linux":
-		display, wayland := e.Getenv("DISPLAY"), e.Getenv("WAYLAND_DISPLAY")
-		if display == "" && wayland == "" {
-			return "", nil, ErrNoProvider
+	bs, err := e.backends(d)
+	if err != nil {
+		return Result{}, err
+	}
+	// Hard stop slightly after the dialog's own timeout; expiry is a timeout.
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(d.Seconds)*time.Second+5*time.Second)
+	defer cancel()
+	for _, b := range bs {
+		out, code, err := e.Run(ctx, b.name, b.args, b.stdin)
+		if ctx.Err() != nil {
+			return Result{Outcome: TimedOut}, nil
 		}
-		if p := e.Find("zenity"); p != "" {
-			return p, []string{"--entry", "--hide-text", "--title=" + req.Title,
-				"--text=" + pangoEscape(msg), "--timeout=" + strconv.Itoa(seconds)}, nil
+		if err != nil {
+			continue // not started: the next backend may show it
 		}
-		if p := e.Find("kdialog"); p != "" {
-			// <qt><pre> forces rich text, so escaped content renders verbatim.
-			return p, []string{"--title", req.Title, "--password",
-				"<qt><pre>" + html.EscapeString(msg) + "</pre></qt>"}, nil
-		}
-		if p := e.Find("ssh-askpass"); p != "" && display != "" {
-			return p, []string{msg}, nil
+		if r := b.parse(out, code); r.Outcome != Unavailable {
+			return r, nil
 		}
 	}
-	return "", nil, ErrNoProvider
+	return Result{Outcome: Unavailable}, nil
 }
 
 // Ask shows the dialog and returns the password.
 func (e Env) Ask(ctx context.Context, req Request) ([]byte, error) {
-	if req.Timeout <= 0 {
-		req.Timeout = DefaultTimeout
-	}
-	name, args, err := e.Command(req)
+	r, err := e.show(ctx, req.dialog())
 	if err != nil {
 		return nil, err
 	}
-	// Hard stop slightly after the dialog's own timeout; expiry is a cancel.
-	ctx, cancel := context.WithTimeout(ctx, req.Timeout+5*time.Second)
-	defer cancel()
-	out, code, err := e.Run(ctx, name, args)
-	if err != nil {
-		return nil, ErrNoProvider
-	}
-	if code != 0 || ctx.Err() != nil {
-		return nil, ErrCancelled
-	}
-	// The exit code alone tells a cancel from an answer: OK on an empty field
-	// is an empty answer (an account or secret without a password), returned
-	// as a non-nil empty slice so callers can tell it from "not asked yet".
-	password := bytes.TrimSuffix(out, []byte("\n"))
-	if bytes.ContainsAny(password, "\n\r\x00") {
-		return nil, ErrCancelled
-	}
-	if password == nil {
-		password = []byte{}
-	}
-	return password, nil
+	return r.answer()
 }
 
 // Choice is a request for one of up to three buttons. Buttons[0] is the
@@ -202,107 +229,12 @@ type Choice struct {
 // timeout and a closed dialog all return 0 with a nil error.
 type Chooser func(ctx context.Context, c Choice) (int, error)
 
-// macChoose is fixed: title, message, timeout, then the button labels arrive
-// as argv items.
-//
-// The first button is the default button and nothing else. It must not also
-// be named as the cancel button: macOS then gives it the Escape key only, and
-// Return does nothing at all, so the user has to click a button to get rid of
-// the dialog (seen on macOS 26). As the default button it is highlighted and
-// Return presses it; Escape is not bound, and a timeout refuses.
-const macChoose = `on run argv
-activate
-set bs to items 4 thru -1 of argv
-set r to display dialog (item 2 of argv) with title (item 1 of argv) buttons bs default button 1 with icon caution giving up after ((item 3 of argv) as integer)
-if gave up of r then return ""
-return button returned of r
-end run`
-
-// ChooseCommand picks the dialog program and its arguments for c.
-func (e Env) ChooseCommand(c Choice) (string, []string, error) {
-	seconds := int(c.Timeout / time.Second)
-	if seconds <= 0 {
-		seconds = int(DefaultTimeout / time.Second)
-	}
-	if len(c.Buttons) < 2 || len(c.Buttons) > 3 {
-		return "", nil, errors.New("a choice needs 2 or 3 buttons")
-	}
-	switch e.GOOS {
-	case "darwin":
-		return "/usr/bin/osascript", append([]string{"-e", macChoose, c.Title, c.Text, strconv.Itoa(seconds)}, c.Buttons...), nil
-	case "linux":
-		if e.Getenv("DISPLAY") == "" && e.Getenv("WAYLAND_DISPLAY") == "" {
-			return "", nil, ErrNoProvider
-		}
-		if p := e.Find("zenity"); p != "" {
-			// --default-cancel gives the refusal the focus. Without it Return
-			// presses the OK button, which is the approval here.
-			args := []string{"--question", "--default-cancel", "--title=" + c.Title, "--text=" + pangoEscape(c.Text),
-				"--timeout=" + strconv.Itoa(seconds), "--cancel-label=" + c.Buttons[0], "--ok-label=" + c.Buttons[1]}
-			if len(c.Buttons) == 3 {
-				args = append(args, "--extra-button="+c.Buttons[2])
-			}
-			return p, args, nil
-		}
-		if p := e.Find("kdialog"); p != "" {
-			text := "<qt><pre>" + html.EscapeString(c.Text) + "</pre></qt>"
-			if len(c.Buttons) == 3 {
-				return p, []string{"--title", c.Title, "--yesnocancel", text, "--yes-label", c.Buttons[1],
-					"--no-label", c.Buttons[2], "--cancel-label", c.Buttons[0]}, nil
-			}
-			return p, []string{"--title", c.Title, "--yesno", text, "--yes-label", c.Buttons[1],
-				"--no-label", c.Buttons[0]}, nil
-		}
-	}
-	// ssh-askpass cannot show buttons.
-	return "", nil, ErrNoProvider
-}
-
 // Choose shows the dialog and returns the button index.
 func (e Env) Choose(ctx context.Context, c Choice) (int, error) {
-	if c.Timeout <= 0 {
-		c.Timeout = DefaultTimeout
-	}
-	name, args, err := e.ChooseCommand(c)
+	d := c.dialog()
+	r, err := e.show(ctx, d)
 	if err != nil {
 		return 0, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, c.Timeout+5*time.Second)
-	defer cancel()
-	out, code, err := e.Run(ctx, name, args)
-	if err != nil {
-		return 0, ErrNoProvider
-	}
-	if ctx.Err() != nil {
-		return 0, nil
-	}
-	label := strings.TrimSuffix(string(out), "\n")
-	switch {
-	case e.GOOS == "darwin":
-		if code != 0 {
-			return 0, nil
-		}
-		for i, b := range c.Buttons {
-			if label == b {
-				return i, nil
-			}
-		}
-		return 0, nil
-	case strings.HasSuffix(name, "zenity"):
-		if code == 0 {
-			return 1, nil
-		}
-		if code == 1 && len(c.Buttons) == 3 && label == c.Buttons[2] {
-			return 2, nil
-		}
-		return 0, nil
-	default: // kdialog: 0 yes, 1 no, 2 cancel
-		if code == 0 {
-			return 1, nil
-		}
-		if code == 1 && len(c.Buttons) == 3 {
-			return 2, nil
-		}
-		return 0, nil
-	}
+	return r.choice(d)
 }

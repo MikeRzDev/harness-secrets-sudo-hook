@@ -42,6 +42,8 @@ type Installer struct {
 	Store     func(harness string) (cache.Store, error)
 	CheckDeps bool
 	Out       io.Writer
+	// AppDir is where psudo.app goes on macOS (/Applications); "" skips it.
+	AppDir string
 }
 
 func (in *Installer) say(format string, args ...any) { fmt.Fprintf(in.Out, format+"\n", args...) }
@@ -228,6 +230,7 @@ func (in *Installer) UninstallClaudeCode() error {
 	dir := in.ClaudeDir()
 	removeFiles(dir, append([]string{"psudo"}, claudeLegacyFiles...))
 	in.say("Removed psudo from %s and its hook from %s", dir, settings)
+	in.removeApp()
 	return errs
 }
 
@@ -317,6 +320,7 @@ func (in *Installer) UninstallCodex() error {
 	removeFiles(dest, append([]string{"psudo"}, codexLegacyFiles...))
 	os.Remove(dest) // only succeeds when empty
 	in.say("Removed the Codex root hook from %s", dest)
+	in.removeApp()
 	return errs
 }
 

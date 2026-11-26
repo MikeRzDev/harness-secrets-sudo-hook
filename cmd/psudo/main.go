@@ -63,6 +63,8 @@ Stored secrets (the command runs as you, not as root; see docs/secrets.md):
 
 Administration:
   psudo --install=claude-code|codex      psudo --uninstall=claude-code|codex
+  psudo --install=test-app               test builds only (make install-test-app): dialogs from /Applications/psudo.app
+  psudo --uninstall=test-app             back to the osascript dialogs
   psudo --clear-cache[=claude-code|codex]
   psudo --ssh-logout                     close the SSH connections psudo keeps
   psudo --version
@@ -140,6 +142,10 @@ func askpassAllowed(host, dir, token string) bool {
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) == 1 && args[0] == prompt.AppDialogFlag {
+		// psudo.app drawing one of psudo's own dialogs (internal/prompt/app.go).
+		return prompt.ServeApp(stdin, stdout)
+	}
 	if host := os.Getenv(runner.AskpassHostEnv); host != "" {
 		// Only a login the runner is performing right now may show a dialog.
 		dir, err := runner.ControlDir()
@@ -314,8 +320,8 @@ func admin(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		return 0
 	case "install", "uninstall":
-		if !validHarness(value) {
-			fmt.Fprintf(stderr, "psudo: --%s must be claude-code or codex\n", name)
+		if !validHarness(value) && value != "test-app" {
+			fmt.Fprintf(stderr, "psudo: --%s must be claude-code, codex or test-app\n", name)
 			return runner.ExitUsage
 		}
 		home, err := os.UserHomeDir()
@@ -325,6 +331,7 @@ func admin(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		in := &install.Installer{
 			Home: home, CodexHome: os.Getenv("CODEX_HOME"), GOOS: runtime.GOOS, UID: os.Getuid(),
 			Exe: exe, Exec: cache.Run, Store: cache.NewStore, CheckDeps: true, Out: stdout,
+			AppDir: filepath.Dir(prompt.AppBundle),
 		}
 		switch name + ":" + value {
 		case "install:claude-code":
@@ -335,6 +342,14 @@ func admin(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			err = in.InstallCodex()
 		case "uninstall:codex":
 			err = in.UninstallCodex()
+		case "install:test-app":
+			if !prompt.TestApp {
+				fmt.Fprintln(stderr, "psudo: this is not a test build, which is the only kind that uses the test app: run make install-test-app")
+				return runner.ExitUsage
+			}
+			err = in.InstallTestApp()
+		case "uninstall:test-app":
+			err = in.UninstallTestApp()
 		}
 		if err != nil {
 			return fail(err)

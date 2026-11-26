@@ -56,8 +56,7 @@ class HarnessSecretsSudoHook < Formula
       Register psudo with your harness (copies it into the harness's hook folder):
         psudo --install=claude-code
         psudo --install=codex
-      Run the same command again after \`brew upgrade harness-secrets-sudo-hook\` to update that copy.
-    EOS
+      Run the same command again after \`brew upgrade harness-secrets-sudo-hook\` to update that copy.    EOS
   end
 
   test do

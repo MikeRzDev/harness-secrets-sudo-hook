@@ -95,4 +95,5 @@ Neither `ps`, your shell history, nor the transcript should contain the password
 ```
 
 This removes the hook registration, the cached password, the launchd task and the
-binary. The shared `config.json` stays for Codex or a future install.
+binary. On macOS it also removes the test app `/Applications/psudo.app`, if one
+is installed and Codex no longer uses psudo either. The shared `config.json` stays for Codex or a future install.

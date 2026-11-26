@@ -191,7 +191,7 @@ make install-claude-code     # and/or: make install-codex
 
 | | macOS | Linux |
 | --- | --- | --- |
-| Dialog | built-in `osascript` | `zenity`, `kdialog`, or `ssh-askpass` with a logged-in desktop |
+| Dialog | built-in `osascript` (test builds only: `/Applications/psudo.app` via `make install-test-app`, see the spec §6.2) | `zenity`, `kdialog`, or `ssh-askpass` with a logged-in desktop |
 | Remote hosts | OpenSSH 8.4+ (built in) | same |
 | Password cache (opt-in) | login Keychain (built-in) | `secret-tool` (`libsecret-tools`) and a Secret Service provider such as GNOME Keyring |
 
