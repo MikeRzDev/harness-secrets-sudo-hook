@@ -38,7 +38,11 @@ const (
 // positional parameters, never interpolated. It is a single line so it also
 // survives login shells that dislike newlines inside quotes.
 //
-// The script first asks sudoers (sudo -n -l -l) which rule decides this exact
+// An account that is already root (root@host, as on Proxmox, which has no
+// sudo) needs nothing: the script reports "<marker> root" and runs the
+// command itself, with stdin closed. psudo shows no dialog and sends nothing.
+//
+// Otherwise the script first asks sudoers (sudo -n -l -l) which rule decides this exact
 // command. When that rule is NOPASSWD (Options: !authenticate), it reports
 // "<marker> nopw" and runs the command with sudo -n: psudo shows no dialog
 // and sends nothing. This covers an account with a NOPASSWD rule that also
@@ -78,6 +82,7 @@ const (
 // /bin/sh, which is checked (sudo -l) before anything runs; if it is not
 // allowed the status is noshell.
 const Script = `s=$1; m=$2; shift 2; ` +
+	`if [ "$(id -u 2>/dev/null)" = 0 ]; then printf '%s root\n' "$m"; exec </dev/null; exec "$@"; fi; ` +
 	`if [ -z "$s" ]; then for c in /usr/bin/sudo /bin/sudo /usr/local/bin/sudo /run/wrappers/bin/sudo /run/current-system/sw/bin/sudo; do if [ -x "$c" ]; then s=$c; break; fi; done; fi; ` +
 	`if [ -z "$s" ]; then echo 'psudo: sudo not found on target' >&2; printf '%s nosudo\n' "$m"; exit 1; fi; ` +
 	`if LC_ALL=C "$s" -n -l -l -- "$@" </dev/null 2>/dev/null | ` +
@@ -118,6 +123,7 @@ const (
 	statusNoSudo   = "nosudo"
 	statusNoShell  = "noshell"
 	statusNoPW     = "nopw"
+	statusRoot     = "root"
 )
 
 // maxPreamble bounds output (such as login banners) accepted before the marker.
@@ -354,9 +360,10 @@ func (r *Runner) Run(ctx context.Context, host string, argv []string) int {
 	timer := time.AfterFunc(r.ReadyWait(), func() { cmd.Process.Kill() })
 	status, overflow := r.awaitStatus(reader, marker)
 	timer.Stop()
-	if status == statusNoPW && !overflow {
-		// sudoers lets this exact command run without a password, so there
-		// is nothing to ask: no dialog, and nothing is written to stdin.
+	if (status == statusNoPW || status == statusRoot) && !overflow {
+		// The account is root, or sudoers lets this exact command run
+		// without a password, so there is nothing to ask: no dialog, and
+		// nothing is written to stdin.
 		stdin.Close()
 		zero(password)
 		release()
@@ -437,7 +444,8 @@ func (r *Runner) Run(ctx context.Context, host string, argv []string) int {
 			"and its sudoers does not allow /bin/sh, which psudo needs there. The command was not run. "+
 			"Fix on the target: allow the account to run /bin/sh via sudo, or set timestamp_timeout above 0.", target)
 	case status == statusNoSudo:
-		r.fail("AUTHENTICATION FAILED: sudo is not installed on %s. The command was not run.", target)
+		r.fail("NO SUDO: sudo is not installed on %s, and the account psudo logged in as is not root. The command "+
+			"was not run. If root may log in to that host, run it again with -H root@<host>.", target)
 	case status == statusAuthFail:
 		r.fail("AUTHENTICATION FAILED: sudo on %s refused to authenticate (see its message above). The command was not run.", target)
 	case remote && (code == ExitSSHFailed || overflow):

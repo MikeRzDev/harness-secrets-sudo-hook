@@ -248,6 +248,13 @@ func fakeSSH() int {
 	}
 	cmd := exec.Command(testShell(), "-c", rest)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if host == "root@pve" {
+		// A login as root: id -u reports 0, and there is no sudo to find.
+		bin := filepath.Join(os.Getenv("PSUDO_STATE"), "rootbin")
+		os.MkdirAll(bin, 0o700)
+		os.WriteFile(filepath.Join(bin, "id"), []byte("#!/bin/sh\necho 0\n"), 0o700)
+		cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+	}
 	if err := cmd.Run(); err != nil {
 		if e, ok := err.(*exec.ExitError); ok {
 			return e.ExitCode()
@@ -829,6 +836,20 @@ func TestNoPasswordRuleRunsWithoutDialog(t *testing.T) {
 			t.Fatal("a password was cached although none was asked for")
 		}
 	})
+}
+
+// A login that is already root (Proxmox has no sudo) runs the command itself:
+// no sudo, no dialog, stdin closed, and the command's own exit code.
+func TestRootLoginRunsWithoutSudo(t *testing.T) {
+	f := newFixture(t, "root@pve")
+	code := f.run("sh", "-c", "echo out; cat; exit 3")
+	if code != 3 || f.out.String() != "out\n" || len(f.asks) != 0 {
+		t.Fatalf("exit %d stdout %q asks %d stderr %q", code, f.out.String(), len(f.asks), f.err.String())
+	}
+	if calls := f.sudoCalls(); len(calls) != 0 {
+		t.Fatalf("sudo was called as root: %q", calls)
+	}
+	f.assertNoLeak()
 }
 
 // A sudo whose listing does not name the matching rule gets the password path.

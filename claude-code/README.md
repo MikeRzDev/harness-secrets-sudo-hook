@@ -85,7 +85,7 @@ Neither `ps`, your shell history, nor the transcript should contain the password
 | `sudo` still runs or fails with "a terminal is required" | Restart Claude Code; check `/hooks` lists `psudo --hook=claude-code`. |
 | Exit 250 | No desktop dialog (Linux: `DISPLAY`/`WAYLAND_DISPLAY` and zenity/kdialog), invalid `config.json`, or a locked or missing credential store. |
 | Exit 255 before any dialog | The host is unreachable, or the SSH login failed. Check `ssh <host> true` in a terminal. A host that needs a code or password gets an **SSH login** dialog; a wrong code or a cancel also exits 255. |
-| Exit 252 on a remote host that should work | The remote user must be allowed to use sudo, `requiretty` must be off, and the login shell must be POSIX. |
+| Exit 252 on a remote host that should work | The remote user must be allowed to use sudo, `requiretty` must be off, and the login shell must be POSIX. `NO SUDO` means the host has no sudo (Proxmox, for example): log in as root with `-H root@<host>`. |
 | macOS: launchd task status | `launchctl print "gui/$(id -u)/com.harness-root-hook.claude-code.reaper"` |
 
 ## Uninstall

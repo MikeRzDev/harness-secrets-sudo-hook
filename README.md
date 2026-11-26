@@ -47,11 +47,13 @@ aliases in `~/.ssh/config`. The password travels inside the SSH connection,
 never on a command line. Hosts that ask for more than a key at login (a one-time
 code, a password, a key passphrase) work too: ssh's question appears in a
 dialog, and harness-secrets-sudo-hook keeps the connection open briefly so you don't type the code
-for every command.
+for every command. A host you log in to as root (`psudo -H root@<host>`, as on
+Proxmox, which has no sudo) needs no sudo at all: the command runs directly,
+with no dialog.
 
 **Clear failures.** When something goes wrong, the agent gets one explicit line
 instead of guessing: `WRONG PASSWORD`, `NOT PERMITTED` (sudoers doesn't allow
-that command), `AUTHENTICATION FAILED`, `SSH FAILED`, or "dialog cancelled". It
+that command), `NO SUDO`, `AUTHENTICATION FAILED`, `SSH FAILED`, or "dialog cancelled". It
 can report the problem instead of trying workarounds.
 
 ## How your credentials are handled
@@ -223,6 +225,7 @@ exit 252 it names the cause:
 | --- | --- |
 | `psudo: WRONG PASSWORD: …` | sudo rejected the password (a stale cached one is cleared) |
 | `psudo: NOT PERMITTED: …` | sudoers doesn't allow this account to run that exact command (checked with `sudo -l` before anything runs) |
+| `psudo: NO SUDO: …` | the target has no sudo and the login account is not root; `-H root@<host>` works where root may log in |
 | `psudo: AUTHENTICATION FAILED: …` | any other refusal, for example `requiretty`; sudo's own message is shown above it |
 
 ### Hosts that need a code or password
