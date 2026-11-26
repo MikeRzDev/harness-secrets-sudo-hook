@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"regexp"
+	"strings"
 
 	"github.com/MikeRzDev/harness-secrets-sudo-hook/internal/shquote"
 )
@@ -41,6 +42,28 @@ const DynamicReason = "Not run: the program name in this command is computed (fo
 	"(ssh -i key root@host '...', /path/to/psudo -H host ...), not taken from a variable. Variables in the " +
 	"arguments are fine, and so is a variable folder in double quotes before a written-out name " +
 	"(./\"$h\"/fleet-ssh, \"$HOME\"/bin/tool)."
+
+// SSHPassReason is shown when sshpass, and no sudo, is what was denied. The
+// sudo reason made models answer a password-login task with a root command.
+func SSHPassReason(psudo string) string {
+	p := shquote.Quote(psudo)
+	return "Not run: sshpass puts an SSH password on the command line, where the harness and its logs see it, so " +
+		"psudo's guard refuses it. This is not a refusal of the task. Log in with a key (plain ssh), or run the " +
+		"command through " + p + " -H <ssh-host> <command> [args...]: when the host needs a password or a code to " +
+		"log in, psudo asks the user for it in a dialog and keeps that connection for a while. Note that psudo -H " +
+		"runs the command as root; never ask for or handle the password yourself."
+}
+
+// sshpassOnly reports whether a command names sshpass and not sudo.
+func sshpassOnly(command string) bool {
+	text := strings.ReplaceAll(command, ownName, "x")
+	return sshpassWord.MatchString(text) && !sudoWord.MatchString(text)
+}
+
+var (
+	sshpassWord = regexp.MustCompile(`(^|[^A-Za-z0-9_])sshpass([^A-Za-z0-9_]|$)`)
+	sudoWord    = regexp.MustCompile(`(^|[^A-Za-z0-9_])sudo([^A-Za-z0-9_]|$)`)
+)
 
 // Converted is the note added for the model when its command was converted.
 func Converted(command string) string {
@@ -127,6 +150,9 @@ func ClaudeCode(in io.Reader, out io.Writer, psudo string) error {
 		var whole map[string]json.RawMessage
 		if converted, ok := Rewrite(*input.Command, psudo); ok && json.Unmarshal(event.ToolInput, &whole) == nil {
 			return convert(out, event.PermissionMode, whole, converted)
+		}
+		if sshpassOnly(*input.Command) {
+			return denyWith(out, SSHPassReason(psudo))
 		}
 		return deny(out, psudo)
 	case denyDynamic:

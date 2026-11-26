@@ -119,6 +119,37 @@ func readsStdin(c *simpleCmd, i int) bool {
 	return i > 0 || c.input || len(c.heredocs) > 0 || len(c.herestr) > 0
 }
 
+// wrappedPrograms returns the index of each program a wrapper at k runs on
+// this computer: through a chain of wrappers (builtin exec sudo), and after
+// each -exec, -execdir, -ok or -okdir of find. watch is left out: it runs its
+// command again every few seconds, and psudo would ask each time.
+func wrappedPrograms(words []word, k int, self string) []int {
+	var out []int
+	for k < len(words) {
+		name := base(words[k].text)
+		switch {
+		case name == "find":
+			for e := k + 1; e+1 < len(words); e++ {
+				switch words[e].text {
+				case "-exec", "-execdir", "-ok", "-okdir":
+					out = append(out, e+1)
+				}
+			}
+			return out
+		case wrappers[name] && name != "watch":
+			next, _ := wrapped(name, words, k, self, 0)
+			if next >= len(words) {
+				return out
+			}
+			out = append(out, next)
+			k = next
+		default:
+			return out
+		}
+	}
+	return out
+}
+
 // Rewrite returns command with sudo converted to psudo, or false when some
 // sudo in it cannot be converted exactly.
 func Rewrite(command, self string) (string, bool) {
@@ -165,15 +196,18 @@ func Rewrite(command, self string) (string, bool) {
 				}
 				edits = append(edits, edit{c.words[k].start, c.words[j].start, psudo + " -H " + host.text + " "})
 			case wrappers[name]:
-				for n := k + 1; n < len(c.words); n++ {
-					if isSudo(c.words[n]) {
-						j, ok := sudoOptions(c.words, n)
-						if !ok {
-							return "", false
-						}
-						edits = append(edits, edit{c.words[n].start, c.words[j].start, psudo + " "})
-						n = j - 1
+				// Only a sudo the wrapper itself runs is converted: in
+				// timeout 5 ssh host sudo id, sudo runs on the host, where
+				// this psudo does not exist.
+				for _, n := range wrappedPrograms(c.words, k, self) {
+					if !isSudo(c.words[n]) {
+						continue
 					}
+					j, ok := sudoOptions(c.words, n)
+					if !ok {
+						return "", false
+					}
+					edits = append(edits, edit{c.words[n].start, c.words[j].start, psudo + " "})
 				}
 			}
 		}

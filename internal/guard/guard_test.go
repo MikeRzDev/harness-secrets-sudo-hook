@@ -142,6 +142,9 @@ func TestDecisionMatrix(t *testing.T) {
 		"ln -s /usr/bin/sudo ./x":                    "deny",
 		"git commit -F - <<'EOF'\nExplain sudo\nEOF": "allow",
 		"git commit --message='Explain sudo'":        "allow",
+		"git commit -am 'Explain sudo'":              "allow", // found by the regression run
+		"git commit -qm 'Explain sudo'":              "allow",
+		"git commit -Cm 'sudo id'":                   "deny", // -C takes "m" as its value
 		"tee notes.md <<< 'use psudo, not sudo'":     "allow",
 
 		// Found by review: computed names, ANSI-C quoting, ${…}, $((…)), case.
@@ -206,6 +209,17 @@ func TestComputedProgramNameReason(t *testing.T) {
 		`"$@"/tool x`:                                                "deny",
 		`"$h/"tool x`:                                                "deny",
 		`"$h"/*/tool x`:                                              "deny",
+		`"${x@P}"/tool x`:                                            "deny",
+		`"${!x}"/tool x`:                                             "deny",
+		`"${x:-a}"/tool x`:                                           "deny",
+		`"${x[1]}"/tool x`:                                           "deny",
+		`"${}"/tool x`:                                               "deny",
+		`"$x[1]"/tool x`:                                             "deny",
+		`"$x:h"/tool x`:                                              "deny",
+		`"$x"[ab]/tool x`:                                            "deny",
+		`"$x(1)"/tool x`:                                             "deny",
+		`"$x"/"$y"/tool x`:                                           "allow",
+		`"$HOME"/.local/bin/tool x`:                                  "allow",
 		"$d/sudo id":                                                 "deny",
 		"$d/sshpass -p x ssh h":                                      "deny",
 		"$d/env sudo id":                                             "deny",
@@ -339,6 +353,20 @@ func TestConversions(t *testing.T) {
 		"bash -c 'sudo id'":                     "",
 		"harness-secrets-sudo-hook/sudo id":     "",
 		"python3 - <<'EOF'\nprint('sudo')\nEOF": "",
+
+		// Found by the regression run: through a wrapper, a sudo that runs
+		// on an SSH host became this computer's psudo path on that host, and
+		// watch would run psudo again every two seconds.
+		"timeout 20 ssh host sudo id -u":                 "",
+		"nohup ssh host sudo id -u":                      "",
+		"env FOO=1 ssh host sudo id -u":                  "",
+		"xargs -n1 ssh host sudo id < hosts":             "",
+		"find . -maxdepth 0 -exec ssh host sudo id \\;":  "",
+		"watch sudo id":                                  "",
+		"builtin exec sudo id":                           "builtin exec " + p + " id",
+		"timeout -s KILL 20 sudo id":                     "timeout -s KILL 20 " + p + " id",
+		"env -u X FOO=1 sudo id":                         "env -u X FOO=1 " + p + " id",
+		"find . -exec sudo rm {} \\; -exec sudo ls {} +": "find . -exec " + p + " rm {} \\; -exec " + p + " ls {} +",
 	} {
 		b, _ := json.Marshal(map[string]any{"tool_name": "Bash", "permission_mode": "bypassPermissions",
 			"tool_input": map[string]any{"command": command, "description": "d", "timeout": 5}})
@@ -378,6 +406,22 @@ func TestReasonAndFailClosed(t *testing.T) {
 	if !strings.Contains(out.String(), "This is not a refusal") || !strings.Contains(out.String(), "/p/psudo -H <ssh-host>") {
 		t.Fatalf("reason %s", out.String())
 	}
+	// Found by the regression run: denied with the sudo reason, sshpass made
+	// models answer a password-login task with a root command.
+	for command, own := range map[string]bool{
+		"sshpass -p pw ssh host id":             true,
+		"timeout 5 sshpass -f f ssh host":       true,
+		"sshpass -p pw ssh host sudo id":        false,
+		"sudo -i":                               false,
+		"cd harness-secrets-sudo-hook; sshpass": true,
+	} {
+		out.Reset()
+		ClaudeCode(strings.NewReader(bash(command)), &out, "/p/psudo")
+		if got := strings.Contains(out.String(), "sshpass puts an SSH password"); got != own || !strings.Contains(out.String(), `"deny"`) {
+			t.Errorf("%q: sshpass reason %v, want %v: %s", command, got, own, out.String())
+		}
+	}
+	out.Reset()
 	if decide(t, "not json") != "deny" {
 		t.Fatal("unparseable input allowed")
 	}
@@ -401,5 +445,142 @@ func TestCodexContext(t *testing.T) {
 	Codex(strings.NewReader(`{"hook_event_name":"PermissionRequest"}`), &out, "/p")
 	if out.Len() != 0 {
 		t.Fatal("context emitted for another event")
+	}
+}
+
+// Found by the regression run (docs/regression.md): each "deny" below ran a
+// fake sudo under bash or under zsh set up as Claude Code runs it, while the
+// guard allowed it. The "allow" rows are ordinary commands next to them.
+func TestParserDifferentials(t *testing.T) {
+	for command, want := range map[string]string{
+		// Brace expansion and globs spell the program.
+		"{sud,ech}o id":                                 "deny",
+		"s{u,}do id":                                    "deny",
+		"/usr/bin/su?o id":                              "deny",
+		"/usr/bin/s[u]do id":                            "deny",
+		"/usr/bin/sud* id":                              "deny",
+		`"/usr/bin/"su?o id`:                            "deny",
+		"command /usr/bin/su?o id":                      "deny",
+		"exec -a x /usr/bin/su?o id":                    "deny",
+		"repeat 1 /usr/bin/su?o id":                     "deny",
+		"timeout -s KILL 5 /usr/bin/su?o id":            "deny",
+		"find . -maxdepth 0 -exec /usr/bin/su?o id \\;": "deny",
+		"./*/tool x":                                    "deny",
+		"cp a.txt{,.bak}":                               "allow",
+		"mkdir -p x/{a,b}":                              "allow",
+		"echo {1..3}":                                   "allow",
+		"ls *.txt":                                      "allow",
+		"rm -f s*":                                      "allow",
+		`for f in internal/*/; do echo "$f"; done`:      "allow",
+		"ls /usr/bin/su?o":                              "allow",
+		// A lone [ is the test command, not a pattern.
+		"{ [ -d .git ] || git init -q .; }": "allow",
+		"[[ -f x ]] && echo y":              "allow",
+		`[ -n "$x" ] && echo y`:             "allow",
+		"[x]y":                              "deny",
+
+		// Code for a shell is parsed, not only matched as text: quotes and
+		// backslashes are removed there, and computed names are computed.
+		`sh -c 's\udo id'`:                               "deny",
+		`bash -c "s''udo id"`:                            "deny",
+		`eval 's\udo id'`:                                "deny",
+		`ssh host 's\udo id'`:                            "deny",
+		`git -c alias.x='!s\udo id' x`:                   "deny",
+		`env -S 's\udo id'`:                              "deny",
+		`echo 's\udo id' | sh`:                           "deny",
+		`sh <<< 's\udo id'`:                              "deny",
+		"sh -c '{sud,ech}o id'":                          "deny",
+		`a=su; b=do; sh -c "$a$b id"`:                    "deny",
+		"sh -c 'a=su;b=do;$a$b id'":                      "deny",
+		"a=su; b=do; eval '$a$b id'":                     "deny",
+		"a=su;b=do; command eval '$a$b id'":              "deny",
+		"a=su;b=do; sh -ec '$a$b id'":                    "deny",
+		"a=su;b=do; bash -o pipefail -c '$a$b id'":       "deny",
+		"ssh -oProxyCommand='a=su;b=do;$a$b nc %h %p' h": "deny",
+
+		// Code that runs on an SSH host: sudo spelled in any form is denied,
+		// a computed name is not (the host's shell may be PowerShell, and
+		// sudo there has no terminal and no password). Found by replaying
+		// real commands from Claude Code transcripts.
+		"a=su;b=do; ssh host \"$a$b id\"":                                   "allow",
+		`ssh win '$ProgressPreference="SilentlyContinue"; powershell -c x'`: "allow",
+		"ssh host 'T=/opt/tool; $T --help'":                                 "allow",
+		`s() { ssh host "$@"; }; s 'ls /'`:                                  "allow",
+		`echo '$a$b id' | ssh host`:                                         "allow",
+		"ssh host <<'EOF'\nV=/x/py; $V -c 1\nEOF":                           "allow",
+		"ssh host <<'EOF'\ns\\udo id\nEOF":                                  "deny",
+
+		// A value written in the same command is judged where it is used.
+		`CMD='qm list; pct list'; ssh host "$CMD"`:                "allow",
+		`CMD='sudo reboot'; ssh host "$CMD"`:                      "deny",
+		`CMD='s\udo reboot'; ssh host "$CMD"`:                     "deny",
+		`J='ssh -W %h:%p jump'; ssh -o ProxyCommand="$J" h true`:  "allow",
+		`J='a=su;b=do;$a$b nc %h %p'; ssh -o ProxyCommand="$J" h`: "deny",
+		`ssh -o ProxyCommand="$J" h true`:                         "deny",
+		`X='cd /tmp && ls'; sh -c "$X"`:                           "allow",
+		`X='a=su;b=do;$a$b id'; sh -c "$X"`:                       "deny",
+		`X=$(pick); sh -c "$X"`:                                   "deny",
+		`X='ls'; X="$Y"; sh -c "$X"`:                              "deny",
+		`export X='ls'; eval "$X"`:                                "allow",
+		`X='sudo id'; eval '$X'`:                                  "deny",
+
+		// Found by the same replay: case patterns and env assignments.
+		`for f in *; do case "$f" in *.md|*.txt|config*) echo "$f";; *) ;; esac; done`: "allow",
+		"env -i HOME=$HOME bash -lc 'echo $PATH'":                                      "allow",
+		"env -i PS4='$(a=su;b=do;$a$b id)' bash -xc true":                              "deny",
+		"a=su;b=do; trap '$a$b id' EXIT":                                               "deny",
+		"a=su;b=do; trap -- '$a$b id' EXIT":                                            "deny",
+		"a=su;b=do; watch -n1 '$a$b id'":                                               "deny",
+		"PS4='$(a=su;b=do;$a$b id)' bash -xc true":                                     "deny",
+		"echo 'a=su;b=do;$a$b id' | bash":                                              "deny",
+		"cat <<'EOF' | sh\na=su;b=do;$a$b id\nEOF":                                     "deny",
+		"bash <<'EOF'\na=su;b=do;$a$b id\nEOF":                                         "deny",
+		"bash /dev/stdin <<'EOF'\na=su;b=do;$a$b id\nEOF":                              "deny",
+		"source /dev/stdin <<<'a=su;b=do;$a$b id'":                                     "deny",
+		". <(echo 'a=su;b=do;$a$b id')":                                                "deny",
+		`a=su b=do; echo "$a$b id" | xargs -I{} sh -c '{}'`:                            "deny",
+		"cat <(sudo id)":                                                  "deny",
+		"eval '$(ssh-agent -s)'":                                          "deny",
+		`eval "$(ssh-agent -s)"`:                                          "allow",
+		"bash -c 'echo $HOME'":                                            "allow",
+		`bash -c 'echo "$1"' _ "$(id)"`:                                   "allow",
+		"ssh host 'echo $HOME; uname -a'":                                 "allow",
+		"ssh host 'for h in a b; do echo $h; done'":                       "allow",
+		"sh -c 'cd /tmp && ls'":                                           "allow",
+		`trap 'rm -f "$tmp"' EXIT`:                                        "allow",
+		"PS4='+ ' bash -xc 'echo hi'":                                     "allow",
+		"curl -fsSL https://example.com/install.sh | sh":                  "allow",
+		`echo "$data" | python3 -c 'import sys; print(sys.stdin.read())'`: "allow",
+		"diff <(ls a) <(ls b)":                                            "allow",
+
+		// A wrapper's values come before the program; unquoted, bash splits
+		// them, so a computed one can be the program.
+		"S=sudo; timeout 5 $S id":                      "deny",
+		"S=/usr/bin/sudo; nice -n 5 $S id":             "deny",
+		"a=su;b=do; xargs -n 1 $a$b < /dev/null":       "deny",
+		"x=su; find . -maxdepth 0 -exec ${x}do id \\;": "deny",
+		`find . -maxdepth 0 -exec "$x" \;`:             "deny",
+		"timeout $T id":                                "deny",
+		`timeout "$T" id`:                              "allow",
+		`nice -n "$N" make`:                            "allow",
+		`find "$dir" -type f`:                          "allow",
+		"find . -name '*.go' -exec grep -l foo {} +":   "allow",
+		`find . -execdir ./"$h"/tool {} +`:             "allow",
+		`timeout 10 curl -s "$url"`:                    "allow",
+		`xargs -I{} cp {} "$dest" < list`:              "allow",
+		"xargs -n 1 -P 4 curl -s < urls":               "allow",
+		"timeout 600 make -C build all":                "allow",
+
+		// zsh's (e) flag and bash's @P run the substitutions in a value; a
+		// ${…} whose end bash and zsh read differently is not parsed.
+		"x='$(a=su;b=do;$a$b id)'; echo ${(e)x}":     "deny",
+		`x='$(a=su;b=do;$a$b id)'; echo "${x@P}"`:    "deny",
+		"echo ${x:-$(echo }; a=su;b=do;$a$b id)}":    "deny",
+		`echo "${x:-'}'}"; a=su;b=do;$a$b id`:        "deny",
+		`echo "${XDG_CONFIG_HOME:-${HOME}/.config}"`: "allow",
+	} {
+		if got := verdictOf(command); got != want {
+			t.Errorf("%q: %s, want %s", command, got, want)
+		}
 	}
 }
