@@ -327,6 +327,20 @@ These were found by the Claude Code runs and by replaying 4520 Bash commands fro
 
 - **Test:** `TestAppOfAnotherBuildIsNotUsed` (internal/prompt/prompt_test.go). It accepts a copy of the same build with extra bytes, as the ad hoc signature leaves them. It refuses a file that is not executable, a script, another Go binary (the `go` command) and a missing app.
 
+### 5.7b Guard: a followed variable could be set another way (after the run)
+
+Two automatic security reviews of the pushed commits found that the value followed by 5.6 could be stale. The guard noted only `NAME=value` assignments, so these were allowed although `sh -c "$X"` alone is refused:
+- `X=true; printf -v X …; sh -c "$X"`, and the same with `declare -n`, `getopts`, `let`, or `read X` then `eval "$X"`;
+- names the shell sets itself, such as `REPLY=true; read; sh -c "$REPLY"`, and `$_`, OPTARG or MAPFILE;
+- names set without being written out, such as `printf -v "$N"`, `eval`, `source`, `${(P)N::=…}` or `${!N}`.
+
+The fix fails closed. A variable is followed only when all of these hold:
+- its name appears only as literal assignments and exact `$NAME` / `${NAME}` reads;
+- it is not a name the shell sets;
+- the command has no builtin that can set variables or run code in the shell, and no assigning or indirect expansion.
+
+A variable that is not followed is judged as computed, and also as each literal value it was given, which can only add refusals. The cost: `X='ls'; eval "$X"` is now refused as computed code. Replaying the 4760 transcript commands against the pushed build changed no decision. Tests are in `TestParserDifferentials`.
+
 ### 5.8 Tests
 
 After the last change, `go vet ./... && go test -count=1 ./...` and `go test -count=1 -tags psudo_testapp ./internal/prompt ./internal/install ./cmd/psudo` pass. `make install-test-app` reinstalled all three copies from one build.

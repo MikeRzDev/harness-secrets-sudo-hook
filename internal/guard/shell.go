@@ -79,10 +79,13 @@ type pipeline struct{ cmds []*simpleCmd }
 // CMD='qm list' lets ssh host "$CMD" be judged by what it runs. A variable
 // that is ever given a computed value is unknown.
 //
-// Only plain assignments are modelled. So a variable is known only when its
-// name appears in the command as those assignments and as exact $NAME or
-// ${NAME} reads, nowhere else: read NAME, printf -v NAME, for NAME in,
-// getopts, let, (( )) and the like set it in ways the guard does not follow.
+// Only plain assignments are modelled, and the guard fails closed: a
+// variable is known only when its name appears in the command as those
+// assignments and as exact $NAME or ${NAME} reads, nowhere else (read NAME,
+// for NAME in, getopts, let, (( )) set it too); when it is not a name the
+// shell sets itself (REPLY, OPTARG, $_ …); and when the command has nothing
+// that can set a variable without naming it (settersWord: read, printf,
+// eval, source …, or an expansion such as ${(P)n::=v} or ${!n}).
 type scope struct {
 	src     string // the whole command, to find every mention of a name
 	lits    map[string][]string
@@ -118,21 +121,90 @@ var identifier = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
 // expanded here, can have: those assigned to NAME in this command. It
 // returns nil for any other word and for a variable that is unknown.
 func (sc *scope) literal(w word) []string {
-	if sc == nil || !w.dynamic || w.opaque {
+	name := sc.varOf(w)
+	if name == "" || sc.unknown[name] {
 		return nil
+	}
+	// Each literal assignment is one mention; any other one may set it.
+	if mentions(sc.src, name) != len(sc.lits[name]) || shellSets(name) || setsUnnamed(sc.src) {
+		return nil
+	}
+	return sc.lits[name]
+}
+
+// varOf returns NAME for a word that is exactly $NAME or ${NAME}, or "".
+func (sc *scope) varOf(w word) string {
+	if sc == nil || !w.dynamic || w.opaque {
+		return ""
 	}
 	name := strings.TrimPrefix(w.text, "$")
 	if strings.HasPrefix(name, "{") && strings.HasSuffix(name, "}") {
 		name = name[1 : len(name)-1]
 	}
-	if name == w.text || varName.FindString(name) != name || sc.unknown[name] {
-		return nil
+	if name == w.text || varName.FindString(name) != name {
+		return ""
 	}
-	// Each literal assignment is one mention; any other one may set it.
-	if mentions(sc.src, name) != len(sc.lits[name]) {
-		return nil
+	return name
+}
+
+// candidates returns the literal values assigned to the variable of w in
+// this command, also when literal does not follow it. Judging them as well
+// can only add a refusal: a command that assigns a value with the root
+// command and then reads the variable is refused even when the variable is
+// not followed.
+func (sc *scope) candidates(w word) []string {
+	if name := sc.varOf(w); name != "" {
+		return sc.lits[name]
 	}
-	return sc.lits[name]
+	return nil
+}
+
+// setters are the commands that can set a variable of the shell they run in,
+// or run code there, without the variable's name being written next to them
+// (read sets REPLY, printf -v "$n" a computed one, eval and source anything).
+// precommand words that can run them (command, builtin, noglob) count too.
+var setters = map[string]bool{
+	"read": true, "select": true, "getopts": true, "mapfile": true, "readarray": true,
+	"printf": true, "print": true, "declare": true, "typeset": true, "local": true,
+	"export": true, "readonly": true, "eval": true, "source": true, "let": true,
+	"unset": true, "wait": true, "coproc": true, "command": true, "builtin": true,
+	"enable": true, "noglob": true, "nocorrect": true, "vared": true, "zparseopts": true,
+	"zstyle": true, "sysread": true, "strftime": true, "getln": true, "zmodload": true,
+	"autoload": true, "trap": true, "alias": true, "fc": true, "hash": true, "emulate": true,
+}
+
+// setsUnnamed reports whether src may set a variable whose name it does not
+// write out: a word in setters (anywhere, also inside quotes: a false alarm
+// only means the variable is not followed), the . builtin, or an expansion
+// that assigns or names a variable indirectly.
+func setsUnnamed(src string) bool {
+	for _, m := range identifier.FindAllString(src, -1) {
+		if setters[m] {
+			return true
+		}
+	}
+	return dotCommand.MatchString(src) || strings.Contains(src, "${!") || strings.Contains(src, "(P)") ||
+		strings.Contains(src, ":=") || strings.Contains(src, "::=") || strings.Contains(src, "((")
+}
+
+// dotCommand is the . builtin (source) as a command word.
+var dotCommand = regexp.MustCompile(`(^|[\s;&|(){}!])\.(\s|$)`)
+
+// shellSets reports whether the shell itself sets name (bash or zsh): its
+// value then need not come from an assignment in the command.
+func shellSets(name string) bool {
+	if strings.HasPrefix(name, "BASH") || strings.HasPrefix(name, "ZSH") || strings.HasPrefix(name, "COMP_") {
+		return true
+	}
+	switch name {
+	case "_", "REPLY", "reply", "OPTARG", "OPTIND", "OPTERR", "MAPFILE", "PWD", "OLDPWD", "RANDOM",
+		"SRANDOM", "SECONDS", "LINENO", "PIPESTATUS", "pipestatus", "status", "HISTCMD", "EPOCHREALTIME",
+		"EPOCHSECONDS", "COPROC", "match", "MATCH", "mbegin", "mend", "MBEGIN", "MEND", "argv", "ERRNO",
+		"PATH", "path", "FPATH", "fpath", "CDPATH", "cdpath", "MANPATH", "manpath", "IFS", "UID", "EUID",
+		"PPID", "SHLVL", "HOME", "USER", "LOGNAME", "SHELL", "TTY", "PS4", "PROMPT_COMMAND", "TRY_BLOCK_ERROR":
+		return true
+	}
+	return false
 }
 
 // record notes the assignment w, which is literal unless w is dynamic.
@@ -1239,6 +1311,9 @@ func (c *simpleCmd) codeOf(ws []word) []codeText {
 		texts := []string{w.text}
 		if vals := c.scope.literal(w); len(vals) > 0 {
 			texts, resolved = vals, true
+		} else if vals := c.scope.candidates(w); len(vals) > 0 {
+			// Not followed: judged as computed, and as each value it was given.
+			texts = append(append([]string{}, vals...), w.text)
 		}
 		var next []codeText
 		for _, o := range out {

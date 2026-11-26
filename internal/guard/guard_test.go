@@ -521,7 +521,7 @@ func TestParserDifferentials(t *testing.T) {
 		`X='a=su;b=do;$a$b id'; sh -c "$X"`:                       "deny",
 		`X=$(pick); sh -c "$X"`:                                   "deny",
 		`X='ls'; X="$Y"; sh -c "$X"`:                              "deny",
-		`export X='ls'; eval "$X"`:                                "allow",
+		`export X='ls'; eval "$X"`:                                "deny", // eval and export may set variables: X is not followed
 		`X='sudo id'; eval '$X'`:                                  "deny",
 		`X='ls'; sh -c "${X}"`:                                    "allow",
 
@@ -538,7 +538,27 @@ func TestParserDifferentials(t *testing.T) {
 		`X=true; mapfile -t X < f; sh -c "$X"`:      "deny",
 		`X=true; for X in a b; do sh -c "$X"; done`: "deny",
 		`X=true; (( X = 1 )); sh -c "$X"`:           "deny",
-		`X=true; IFS= read -r X < f; ssh host "$X"`: "allow",
+		// Variables set without their name being written, and names the
+		// shell sets itself, are never followed.
+		`REPLY=true; read; sh -c "$REPLY"`:                "deny",
+		`OPTARG=true; getopts a: o -a x; sh -c "$OPTARG"`: "deny",
+		`MAPFILE=true; mapfile < f; sh -c "$MAPFILE"`:     "deny",
+		`_=true; echo x; sh -c "$_"`:                      "deny",
+		`X=true; N=Y; printf -v "$N" x; sh -c "$X"`:       "deny",
+		`X=true; read N < f; declare "$N=1"; sh -c "$X"`:  "deny",
+		`X=true; source ./f; sh -c "$X"`:                  "deny",
+		`X=true; . ./f; sh -c "$X"`:                       "deny",
+		`X=true; eval "$Y"; sh -c "$X"`:                   "deny",
+		`X=true; : ${(P)N::=v}; sh -c "$X"`:               "deny",
+		`X=true; command read N; sh -c "$X"`:              "deny",
+		`X=true; f() { read; }; f; sh -c "$X"`:            "deny",
+		// A variable that is not followed is still judged by every literal
+		// value it is given.
+		`CMD='sudo reboot'; printf x; ssh host "$CMD"`:       "deny",
+		`CMD='qm list'; printf x; ssh host "$CMD"`:           "allow",
+		`CMD='sudo reboot'; read CMD; ssh host "$CMD"`:       "deny",
+		`X='cd /tmp && ls'; Y='pwd'; sh -c "$X"; sh -c "$Y"`: "allow",
+		`X=true; IFS= read -r X < f; ssh host "$X"`:          "allow",
 
 		// Found by the same replay: case patterns and env assignments.
 		`for f in *; do case "$f" in *.md|*.txt|config*) echo "$f";; *) ;; esac; done`: "allow",
