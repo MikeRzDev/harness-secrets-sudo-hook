@@ -36,6 +36,13 @@ func Reason(psudo string) string {
 // DynamicReason is shown when the only problem is a program name the guard
 // cannot read. It says what was wrong and that the command itself, ssh as
 // root included, is fine once the name is written out.
+// TooManyReason is the deny message for code built from variables that are
+// given more values in one command than the guard can check.
+const TooManyReason = "Not run: this command assigns a variable so many different values before using it as " +
+	"code (sh -c, eval, ssh) that psudo's guard cannot check every combination, so it refuses the command. " +
+	"Nothing else was the problem. Run it again with the code written out directly, or split it into " +
+	"separate commands that each set the variable once."
+
 const DynamicReason = "Not run: the program name in this command is computed (for example $S or ${cmd}), so psudo's " +
 	"guard cannot see what would run, and it refuses whatever it cannot check for sudo. Nothing else in the " +
 	"command was the problem. Run it again with the program's name or path written out literally in each command " +
@@ -157,6 +164,8 @@ func ClaudeCode(in io.Reader, out io.Writer, psudo string) error {
 		return deny(out, psudo)
 	case denyDynamic:
 		return denyWith(out, DynamicReason)
+	case denyTooMany:
+		return denyWith(out, TooManyReason)
 	case denyCache:
 		return denyWith(out, CacheReason)
 	}

@@ -26,9 +26,17 @@ const (
 	// sudo, but with its own reason: the fix is to write the name out, and
 	// the sudo reason made models believe the command itself was forbidden.
 	denyDynamic
+	// denyTooMany is code built from variables with more combinations of
+	// values than the guard judges (maxCombinations). It fails closed, also
+	// on SSH hosts, where a computed name is otherwise allowed.
+	denyTooMany
 	denyRoot
 	denyCache
 )
+
+// maxCombinations is the most combinations of variable values codeOf
+// judges; past it the code is refused.
+const maxCombinations = 16
 
 func worse(a, b verdict) verdict {
 	if b > a {
@@ -1313,20 +1321,19 @@ func (c *simpleCmd) runsShell(self string, depth int) (shell, local bool) {
 }
 
 type codeText struct {
-	text   string
-	judged bool
+	text    string
+	judged  bool
+	tooMany bool // more combinations than maxCombinations: refused
 }
 
 // codeOf returns the text words make when joined, once for each value a
 // variable among them can have (scope.literal): CMD='qm list'; ssh h "$CMD"
 // is the code qm list. A variable with no known value stays as written. With
-// too many combinations, the words are judged as written and every value on
-// its own: words are joined with spaces, so no command can be spelled across
-// two values, and no value is left unjudged.
+// more combinations than maxCombinations, it fails closed: the result is
+// marked tooMany, and the code is refused.
 func (c *simpleCmd) codeOf(ws []word) []codeText {
 	out := []codeText{{}}
 	resolved := false
-	var each []codeText // every value of every word, for the fallback
 	for i, w := range ws {
 		texts := []string{w.text}
 		if vals := c.scope.literal(w); len(vals) > 0 {
@@ -1334,11 +1341,6 @@ func (c *simpleCmd) codeOf(ws []word) []codeText {
 		} else if vals := c.scope.candidates(w); len(vals) > 0 {
 			// Not followed: judged as computed, and as each value it was given.
 			texts = append(append([]string{}, vals...), w.text)
-		}
-		if len(texts) > 1 || texts[0] != w.text {
-			for _, t := range texts {
-				each = append(each, codeText{text: t})
-			}
 		}
 		var next []codeText
 		for _, o := range out {
@@ -1349,13 +1351,8 @@ func (c *simpleCmd) codeOf(ws []word) []codeText {
 				next = append(next, codeText{text: o.text + t})
 			}
 		}
-		if len(next) > 16 {
-			for _, w := range ws[i+1:] {
-				for _, t := range append(c.scope.literal(w), c.scope.candidates(w)...) {
-					each = append(each, codeText{text: t})
-				}
-			}
-			return append([]codeText{{text: joinWords(ws), judged: anyDynamic(ws)}}, each...)
+		if len(next) > maxCombinations {
+			return []codeText{{text: joinWords(ws), judged: anyDynamic(ws), tooMany: true}}
 		}
 		out = next
 	}
@@ -1552,6 +1549,9 @@ func (c *simpleCmd) codeVerdict(name string, k int, self string, depth int) verd
 	subWords := func(ws []word) verdict {
 		r := allow
 		for _, ct := range c.codeOf(ws) {
+			if ct.tooMany {
+				r = worse(r, denyTooMany)
+			}
 			r = worse(r, sub(ct.text, ct.judged))
 		}
 		return r

@@ -3,6 +3,7 @@ package guard
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -565,7 +566,7 @@ func TestParserDifferentials(t *testing.T) {
 		`X='ls'; cd /tmp; echo hi; sh -c "$X"`: "allow",
 		// Too many values: each one is still judged on its own.
 		`C='sudo reboot'; C=v0; C=v1; C=v2; C=v3; C=v4; C=v5; C=v6; C=v7; C=v8; C=v9; C=v10; C=v11; C=v12; C=v13; C=v14; C=v15; C=v16; C=v17; C=v18; C=v19; ssh host "$C" "$C"`: "deny",
-		`C='qm list'; C=v0; C=v1; C=v2; C=v3; C=v4; C=v5; C=v6; C=v7; C=v8; C=v9; C=v10; C=v11; C=v12; C=v13; C=v14; C=v15; C=v16; C=v17; C=v18; C=v19; ssh host "$C" "$C"`:     "allow",
+		`C='qm list'; C=v0; C=v1; C=v2; C=v3; C=v4; C=v5; C=v6; C=v7; C=v8; C=v9; C=v10; C=v11; C=v12; C=v13; C=v14; C=v15; C=v16; C=v17; C=v18; C=v19; ssh host "$C" "$C"`:     "deny",
 		`X='cd /tmp && ls'; Y='pwd'; sh -c "$X"; sh -c "$Y"`: "allow",
 		`X=true; IFS= read -r X < f; ssh host "$X"`:          "allow",
 
@@ -627,5 +628,33 @@ func TestParserDifferentials(t *testing.T) {
 		if got := verdictOf(command); got != want {
 			t.Errorf("%q: %s, want %s", command, got, want)
 		}
+	}
+}
+
+// Code built from a variable with more values than the guard checks is
+// refused with its own reason, on SSH hosts too, where a computed name is
+// otherwise allowed.
+func TestTooManyValuesFailsClosed(t *testing.T) {
+	var many []string
+	for i := 0; i < 20; i++ {
+		many = append(many, fmt.Sprintf("C=v%d", i))
+	}
+	for _, command := range []string{
+		strings.Join(many, "; ") + `; ssh host "$C" "$C"`,
+		strings.Join(many, "; ") + `; eval "$C" "$C"`,
+	} {
+		var out bytes.Buffer
+		if err := ClaudeCode(strings.NewReader(bash(command)), &out, "/home/u/.claude/hooks/psudo"); err != nil {
+			t.Fatal(err)
+		}
+		var res struct{ HookSpecificOutput map[string]any }
+		json.Unmarshal(out.Bytes(), &res)
+		if r, _ := res.HookSpecificOutput["permissionDecisionReason"].(string); r != TooManyReason {
+			t.Errorf("%q: reason %q, want the too-many-values reason", command, r)
+		}
+	}
+	// Under the cap nothing changes.
+	if got := decide(t, bash(`C=a; C=b; ssh host "$C"`)); got != "allow" {
+		t.Errorf("two values: %s", got)
 	}
 }
