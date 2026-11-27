@@ -77,10 +77,21 @@ func fakeSudo() int {
 	// "noticket" models a target whose timestamp does not carry between
 	// separate sudo invocations.
 	valid := exists(ticket) || exists(cached) || mode("nopasswd")
+	// "sudors" models sudo-rs (Ubuntu 25.10 and later) for a cloud image's
+	// default user: NOPASSWD: ALL, also in the sudo group (so -v wants a
+	// password), and no password at all, so authentication always fails.
+	// Its listing for one command names no rule. "rsmsg" gives a wrong
+	// password sudo-rs's messages.
+	sudors := mode("sudors")
+	rsFail := "sudo: Authentication failed, try again.\n\nsudo: Authentication required but not attempted"
 	// authenticate reads one password line like sudo -S, with sudo's messages.
 	authenticate := func() bool {
 		if mode("nopasswd") {
 			return true
+		}
+		if sudors {
+			fmt.Fprintln(os.Stderr, rsFail)
+			return false
 		}
 		if mode("requiretty") {
 			fmt.Fprintln(os.Stderr, "sudo: a terminal is required to read the password")
@@ -89,7 +100,11 @@ func fakeSudo() int {
 		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 		want, _ := os.ReadFile(filepath.Join(state, "password"))
 		if err != nil || strings.TrimSuffix(line, "\n") != string(want) {
-			fmt.Fprintln(os.Stderr, "Sorry, try again.\nsudo: 1 incorrect password attempt")
+			if mode("rsmsg") {
+				fmt.Fprintln(os.Stderr, rsFail)
+			} else {
+				fmt.Fprintln(os.Stderr, "Sorry, try again.\nsudo: 1 incorrect password attempt")
+			}
 			return false
 		}
 		if mode("denied") {
@@ -134,7 +149,7 @@ func fakeSudo() int {
 		switch {
 		case mode("forbidcmd"):
 			return 1
-		case mode("oldsudo"):
+		case mode("oldsudo") || sudors:
 			fmt.Println(args[4])
 			return 0
 		case mode("nopasswd") || mode("nopwcmd"):
@@ -145,8 +160,10 @@ func fakeSudo() int {
 		fmt.Fprintln(os.Stderr, "sudo: a password is required")
 		return 1
 	case len(args) >= 3 && args[0] == "-n" && args[1] == "--":
-		// Real sudo -n reports a disallowed command this way, too.
-		if !(valid || mode("nopwcmd")) || mode("forbidcmd") {
+		// Real sudo -n reports a disallowed command this way, too. The
+		// "nopwcmd" rule covers the command, not /bin/sh.
+		nopw := mode("nopwcmd") && args[2] != "/bin/sh" || sudors
+		if !(valid || nopw) || mode("forbidcmd") {
 			fmt.Fprintln(os.Stderr, "sudo: a password is required")
 			return 1
 		}
@@ -859,6 +876,48 @@ func TestListingWithoutMatchedRuleAsksForPassword(t *testing.T) {
 		os.WriteFile(filepath.Join(f.state, "oldsudo"), nil, 0o600)
 		if code := f.run("true"); code != 0 || len(f.asks) != 1 {
 			t.Fatalf("exit %d asks %d stderr %q", code, len(f.asks), f.err.String())
+		}
+	})
+}
+
+// Regression (fermi-android-dev): an Ubuntu 26.04 cloud VM whose default
+// user has NOPASSWD: ALL and no password, under sudo-rs. Its listing names no
+// rule and its -v wants a password, so psudo showed a dialog and then failed
+// with "Authentication failed". It must run the command with no dialog.
+func TestPasswordlessSudoRsRunsWithoutDialog(t *testing.T) {
+	forEachTarget(t, func(t *testing.T, f *fixture) {
+		os.WriteFile(filepath.Join(f.state, "sudors"), nil, 0o600)
+		store := &memStore{}
+		f.r.Store = func() (cache.Store, error) { return store, nil }
+		argv := []string{"sh", "-c", "echo out; cat; echo err >&2; exit 3"}
+		code := f.run(argv...)
+		if code != 3 || f.out.String() != "out\n" || f.err.String() != "err\n" || len(f.asks) != 0 {
+			t.Fatalf("exit %d stdout %q stderr %q asks %d", code, f.out.String(), f.err.String(), len(f.asks))
+		}
+		wrapped := append([]string{"-n", "--", "/bin/sh", "-c", `exec "$@" </dev/null`, "psudo"}, argv...)
+		want := [][]string{listing(argv...), {"-n", "--", "/bin/sh", "-c", "exit 0"}, wrapped}
+		if calls := f.sudoCalls(); !reflect.DeepEqual(calls, want) {
+			t.Fatalf("sudo calls %q, want %q", calls, want)
+		}
+		if store.writes != 0 {
+			t.Fatal("a password was cached although none was asked for")
+		}
+		f.assertNoLeak()
+	})
+}
+
+// sudo-rs's word for a rejected password is "Authentication failed, try
+// again."; psudo reports it as WRONG PASSWORD, like sudo's "Sorry, try again".
+func TestSudoRsWrongPasswordIsReported(t *testing.T) {
+	forEachTarget(t, func(t *testing.T, f *fixture) {
+		os.WriteFile(filepath.Join(f.state, "rsmsg"), nil, 0o600)
+		sentinel := filepath.Join(f.state, "ran")
+		f.answer = "wrong"
+		if code := f.run("touch", sentinel); code != runner.ExitAuthFailed || exists(sentinel) || len(f.asks) != 1 {
+			t.Fatalf("exit %d ran=%v asks=%d", code, exists(sentinel), len(f.asks))
+		}
+		if !strings.Contains(f.err.String(), "psudo: WRONG PASSWORD:") || strings.Contains(f.err.String(), "Authentication failed") {
+			t.Fatalf("stderr %q", f.err.String())
 		}
 	})
 }

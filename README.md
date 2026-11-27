@@ -49,7 +49,9 @@ code, a password, a key passphrase) work too: ssh's question appears in a
 dialog, and harness-secrets-sudo-hook keeps the connection open briefly so you don't type the code
 for every command. A host you log in to as root (`psudo -H root@<host>`, as on
 Proxmox, which has no sudo) needs no sudo at all: the command runs directly,
-with no dialog.
+with no dialog. An account with passwordless sudo (`NOPASSWD`, as cloud images
+set up for their default user) also gets no dialog, with classic sudo and with
+sudo-rs (the default on Ubuntu 25.10 and later).
 
 **Clear failures.** When something goes wrong, the agent gets one explicit line
 instead of guessing: `WRONG PASSWORD`, `NOT PERMITTED` (sudoers doesn't allow

@@ -48,8 +48,17 @@ const (
 // and sends nothing. This covers an account with a NOPASSWD rule that also
 // has a rule needing a password (such as the sudo group), where sudo -v asks
 // for a password (verifypw=all). sudo -n still decides: if it does need a
-// password after all, it refuses and nothing runs. A sudo whose listing
-// does not name the matching rule takes the password path below.
+// password after all, it refuses and nothing runs.
+//
+// A sudo whose listing allows the command but does not name the matching
+// rule (sudo-rs, the default sudo on Ubuntu 25.10 and later, prints only the
+// command's path) cannot say whether that rule needs a password: its -l asks
+// for one only when no rule is NOPASSWD, and its -v when any rule needs one.
+// So the script asks sudo directly: when sudo -n runs /bin/sh -c 'exit 0',
+// root needs no password (an account with NOPASSWD: ALL, as cloud images set
+// up for their default user, which often has no password at all). It reports
+// "<marker> nopw" and runs the command with sudo -n through /bin/sh, which
+// sudoers was just shown to allow. Otherwise it takes the password path below.
 //
 // Otherwise the script reports "<marker> ready". psudo sends the password only
 // after that line, so the password never goes to a target that is not running
@@ -85,15 +94,18 @@ const Script = `s=$1; m=$2; shift 2; ` +
 	`if [ "$(id -u 2>/dev/null)" = 0 ]; then printf '%s root\n' "$m"; exec </dev/null; exec "$@"; fi; ` +
 	`if [ -z "$s" ]; then for c in /usr/bin/sudo /bin/sudo /usr/local/bin/sudo /run/wrappers/bin/sudo /run/current-system/sw/bin/sudo; do if [ -x "$c" ]; then s=$c; break; fi; done; fi; ` +
 	`if [ -z "$s" ]; then echo 'psudo: sudo not found on target' >&2; printf '%s nosudo\n' "$m"; exit 1; fi; ` +
-	`if LC_ALL=C "$s" -n -l -l -- "$@" </dev/null 2>/dev/null | ` +
+	`if l=$(LC_ALL=C "$s" -n -l -l -- "$@" </dev/null 2>/dev/null); then ` +
+	`if printf '%s\n' "$l" | ` +
 	`awk '/^(Sudoers entry|LDAP Role)/{a=0} /^ *Options:.*!authenticate/{a=1} /^ *Matched:/{if(a)f=1} END{exit !f}'; ` +
 	`then printf '%s nopw\n' "$m"; exec </dev/null; "$s" -n -- "$@"; exit; fi; ` +
+	`case $l in *Matched:*) ;; *) if "$s" -n -- /bin/sh -c 'exit 0' </dev/null >/dev/null 2>&1; ` +
+	`then printf '%s nopw\n' "$m"; exec </dev/null; "$s" -n -- /bin/sh -c 'exec "$@" </dev/null' psudo "$@"; exit; fi;; esac; fi; ` +
 	`printf '%s ready\n' "$m"; IFS= read -r p || exit 1; exec </dev/null; ` +
 	`"$s" -k; ` +
 	`f=$(mktemp 2>/dev/null) || f=/dev/null; ` +
 	`if printf '%s\n' "$p" | LC_ALL=C "$s" -S -p '' -v 2>"$f"; then t=ok; else ` +
 	`e=$(cat "$f" 2>/dev/null); ` +
-	`case $e in *"incorrect password"*|*"Sorry, try again"*) t=badpw;; *"sudoers"*|*"may not run"*|*"not allowed"*) t=denied;; *) t=authfail;; esac; ` +
+	`case $e in *"incorrect password"*|*"Sorry, try again"*|*"Authentication failed, try again"*) t=badpw;; *"sudoers"*|*"may not run"*|*"not allowed"*) t=denied;; *) t=authfail;; esac; ` +
 	`[ "$t" = badpw ] || [ -z "$e" ] || printf '%s\n' "$e" >&2; fi; ` +
 	`[ "$f" = /dev/null ] || rm -f "$f"; ` +
 	`x=; if [ "$t" = ok ] && ! printf '%s\n' "$p" | "$s" -k -S -p '' -l -- "$@" >/dev/null 2>&1; then t=denied; fi; ` +
