@@ -184,7 +184,8 @@ func SessionContext(psudo string, codex bool) string {
 		"A host you log in to as root needs no sudo: psudo -H root@<host> runs the command directly with no dialog, " +
 		"and plain ssh root@<host> with a key is fine too. " +
 		"The arguments are passed through exactly; use " + p + " sh -c '...' for pipelines; psudo takes no sudo options. " +
-		"psudo shows the user a native dialog naming the host and command for the sudo password, and, if the host " +
+		"psudo shows the user a native dialog naming the host and command for the sudo password (on a Mac whose sudo " +
+		"accepts Touch ID, the system's Touch ID sheet instead, for commands on this computer), and, if the host " +
 		"needs a code or password to log in over SSH, a dialog for that too. Never ask the user for a password or " +
 		"code in chat, and never pipe one into a command. Keep the actual command visible in the tool call. " +
 		"Exit 251: the user cancelled; stop that privileged action. 252: authentication failed (the psudo: line says " +

@@ -144,6 +144,8 @@ Why this matters:
 
 For remote targets, SSH runs in batch mode so it can never fall back to prompting.
 
+**Touch ID (this computer, macOS).** When `/etc/pam.d/sudo_local` or `/etc/pam.d/sudo` has an `auth` line for `pam_tid.so` that is not commented out, step 2 needs no password. psudo shows no dialog, does not use the password cache, and runs `TouchIDScript`: sudo -v with stdin from `/dev/null`, so pam_tid shows the system's Touch ID sheet, which also offers the account password. If the sheet is cancelled, or no desktop session can show it, PAM falls through to a password that `-S` cannot read, -v fails, and psudo exits 251. There is no psudo password dialog after it. It would ask again for what the sheet already offered, and it could not work anyway: with pam_tid first in PAM, every sudo -S shows the sheet before it reads stdin. Then `sudo -n -v` checks that -v left a ticket, `sudo -n -l` checks that sudoers allows the command, and the command runs on that ticket (`sudo -n`) with stdin closed. Steps 1 and 3 are as above. Without pam_tid, psudo never makes the empty-stdin attempt, which would only log a failed authentication.
+
 ### 6.4 Enforcement hook
 
 - Event: PreToolUse, tool: Bash.
@@ -178,6 +180,8 @@ A short instruction: privileged commands go through `psudo`; never request, echo
 | Situation | Result |
 |---|---|
 | User cancels the dialog | 251, command not run |
+| User cancels the Touch ID sheet (this computer, pam_tid on) | 251 (`CANCELLED: Touch ID`), command not run, no password dialog |
+| Touch ID worked, but sudo keeps no ticket (`timestamp_timeout` 0) | 252, command not run |
 | Dialog times out | 251, command not run |
 | Wrong password | 252, command not run, no automatic retry |
 | No display available | 250, command not run |

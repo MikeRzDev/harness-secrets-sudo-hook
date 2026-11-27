@@ -232,6 +232,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		Ask:        prompt.System().Ask,
 		ControlDir: runner.ControlDir,
 		Askpass:    exe,
+		TouchID:    func() bool { return runner.TouchIDEnabled(runner.PAMFiles...) },
 		Store:      func() (cache.Store, error) { return cache.NewStore(harness) },
 		TTL:        loadTTL,
 		Lock:       func() (func(), error) { return cache.Lock(harness) },

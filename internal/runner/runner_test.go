@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -82,6 +83,11 @@ func fakeSudo() int {
 		if mode("nopasswd") {
 			return true
 		}
+		if mode("touchid") {
+			// pam_tid: a fingerprint, and nothing is read from stdin.
+			logCall("touchid.log")
+			return true
+		}
 		if mode("requiretty") {
 			fmt.Fprintln(os.Stderr, "sudo: a terminal is required to read the password")
 			return false
@@ -144,6 +150,13 @@ func fakeSudo() int {
 		}
 		fmt.Fprintln(os.Stderr, "sudo: a password is required")
 		return 1
+	case len(args) >= 4 && reflect.DeepEqual(args[:3], []string{"-n", "-l", "--"}):
+		// sudo -l for one command, on the ticket.
+		if !valid || mode("forbidcmd") {
+			return 1
+		}
+		fmt.Println(args[3])
+		return 0
 	case len(args) >= 3 && args[0] == "-n" && args[1] == "--":
 		// Real sudo -n reports a disallowed command this way, too.
 		if !(valid || mode("nopwcmd")) || mode("forbidcmd") {
@@ -377,6 +390,108 @@ func forEachTarget(t *testing.T, test func(t *testing.T, f *fixture)) {
 				test(t, f)
 			})
 		}
+	}
+}
+
+// With Touch ID in sudo's PAM configuration, a fingerprint authenticates a
+// local command: psudo shows no dialog and sends nothing on stdin.
+func TestTouchIDRunsWithoutAPasswordDialog(t *testing.T) {
+	f := newFixture(t, "")
+	f.r.TouchID = func() bool { return true }
+	os.WriteFile(filepath.Join(f.state, "touchid"), nil, 0o600)
+	if code := f.run("printf", "%s", "it's done"); code != 0 || f.out.String() != "it's done" || len(f.asks) != 0 {
+		t.Fatalf("exit %d out %q asks %d err %q", code, f.out.String(), len(f.asks), f.err.String())
+	}
+	if !strings.Contains(f.read("touchid.log"), "-v") {
+		t.Fatal("Touch ID was not used")
+	}
+	// The command ran on the ticket, which is cleared afterwards.
+	if matches, _ := filepath.Glob(filepath.Join(f.state, "ticket-*")); len(matches) != 0 {
+		t.Fatalf("ticket left behind: %v", matches)
+	}
+	// sudoers still decides which command may run.
+	os.WriteFile(filepath.Join(f.state, "forbidcmd"), nil, 0o600)
+	f.out.Reset()
+	f.err.Reset()
+	if code := f.run("true"); code != runner.ExitAuthFailed || len(f.asks) != 0 || !strings.Contains(f.err.String(), "NOT PERMITTED") {
+		t.Fatalf("forbidden: exit %d asks %d err %q", code, len(f.asks), f.err.String())
+	}
+}
+
+// A cancelled Touch ID sheet cancels the command. The sheet offers the
+// password itself, so psudo asks nothing after it, and it never uses the
+// password cache: there is no password to send.
+func TestCancelledTouchIDCancels(t *testing.T) {
+	f := newFixture(t, "")
+	f.r.TouchID = func() bool { return true }
+	store := &memStore{record: &cache.Record{Password: secret, CreatedAt: 999, TTLSeconds: 7200}}
+	f.r.Store = func() (cache.Store, error) { return store, nil }
+	if code := f.run("touch", filepath.Join(f.state, "ran")); code != runner.ExitCancelled || len(f.asks) != 0 ||
+		!strings.Contains(f.err.String(), "CANCELLED: Touch ID") || exists(filepath.Join(f.state, "ran")) {
+		t.Fatalf("exit %d asks %d err %q", code, len(f.asks), f.err.String())
+	}
+	if store.calls != 0 {
+		t.Fatalf("the password cache was used %d times", store.calls)
+	}
+	f.assertNoLeak()
+	if n := strings.Count(f.read("sudo.log"), `"-S","-p","","-v"`); n != 1 {
+		t.Fatalf("%d sudo -v calls", n)
+	}
+	// A computer that keeps no ticket is reported, and nothing runs.
+	os.WriteFile(filepath.Join(f.state, "touchid"), nil, 0o600)
+	os.WriteFile(filepath.Join(f.state, "noticket"), nil, 0o600)
+	f.err.Reset()
+	if code := f.run("touch", filepath.Join(f.state, "ran")); code != runner.ExitAuthFailed || len(f.asks) != 0 ||
+		!strings.Contains(f.err.String(), "timestamp_timeout") || exists(filepath.Join(f.state, "ran")) {
+		t.Fatalf("noticket: exit %d err %q", code, f.err.String())
+	}
+}
+
+// A computer whose sudo does not accept Touch ID uses the password dialog,
+// and psudo makes no sudo -v attempt with an empty stdin.
+func TestWithoutTouchIDThePasswordIsAskedFor(t *testing.T) {
+	f := newFixture(t, "")
+	f.r.TouchID = func() bool { return false }
+	if code := f.run("printf", "ok"); code != 0 || f.out.String() != "ok" || len(f.asks) != 1 {
+		t.Fatalf("exit %d out %q asks %d err %q", code, f.out.String(), len(f.asks), f.err.String())
+	}
+	f.assertNoLeak()
+	if n := strings.Count(f.read("sudo.log"), `"-S","-p","","-v"`); n != 1 {
+		t.Fatalf("%d sudo -v calls", n)
+	}
+}
+
+// A remote host never tries Touch ID: the sensor is on this computer.
+func TestTouchIDIsForThisComputerOnly(t *testing.T) {
+	f := newFixture(t, "example-host")
+	f.r.TouchID = func() bool { return true }
+	if code := f.run("true"); code != 0 || len(f.asks) != 1 || strings.Count(f.read("sudo.log"), `"-S","-p","","-v"`) != 1 {
+		t.Fatalf("exit %d asks %d err %q", code, len(f.asks), f.err.String())
+	}
+}
+
+func TestTouchIDEnabled(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		if runner.TouchIDEnabled("/dev/null") {
+			t.Fatal("Touch ID outside macOS")
+		}
+		t.Skip("pam_tid is macOS only")
+	}
+	dir := t.TempDir()
+	write := func(name, text string) string {
+		p := filepath.Join(dir, name)
+		os.WriteFile(p, []byte(text), 0o644)
+		return p
+	}
+	on := write("on", "# sudo_local\nauth       sufficient     pam_tid.so\n")
+	versioned := write("versioned", "auth sufficient /usr/lib/pam/pam_tid.so.2 # with Touch ID\n")
+	off := write("off", "# uncomment following line to enable Touch ID for sudo\n#auth       sufficient     pam_tid.so\n")
+	other := write("other", "auth sufficient pam_smartcard.so\naccount required pam_tid.so\n")
+	if !runner.TouchIDEnabled(off, on) || !runner.TouchIDEnabled(versioned) {
+		t.Fatal("enabled pam_tid not found")
+	}
+	if runner.TouchIDEnabled(off, other, filepath.Join(dir, "missing")) {
+		t.Fatal("commented or non-auth pam_tid counted")
 	}
 }
 

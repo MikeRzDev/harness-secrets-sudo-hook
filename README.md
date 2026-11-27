@@ -251,6 +251,29 @@ without the code. If that account has passwordless sudo, that means root
 without a dialog. It's the same trade-off as `ControlPersist` in your own ssh
 config. Run `psudo --ssh-logout` when you're done.
 
+### Touch ID on macOS
+
+If sudo on your Mac accepts Touch ID, psudo uses it for commands on this
+computer. You get the system's Touch ID sheet instead of psudo's password
+dialog, and the sheet's **Use Password…** button takes your password as well.
+Cancelling the sheet cancels the command (exit 251). psudo then shows no
+password dialog of its own and sends no password, and it doesn't use the
+password cache. Commands on SSH hosts (`-H`) still use the password dialog:
+the sensor is on this Mac.
+
+To turn on Touch ID for sudo, create `/etc/pam.d/sudo_local` (Apple's
+template says the file survives system updates) with the line that
+`/etc/pam.d/sudo_local.template` has commented out:
+
+```text
+auth       sufficient     pam_tid.so
+```
+
+psudo checks `/etc/pam.d/sudo_local` and `/etc/pam.d/sudo` for that line on
+every command. This turns on Touch ID for every sudo on the Mac, the one you
+type in Terminal included. The sheet names sudo, not the command: the command
+is what the harness's approval prompt shows.
+
 ## Password caching (opt-in)
 
 **Off by default**: every command shows the dialog. You can let local commands

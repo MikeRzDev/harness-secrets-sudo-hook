@@ -81,14 +81,41 @@ const (
 // through /bin/sh only to close its stdin. That needs sudoers to allow
 // /bin/sh, which is checked (sudo -l) before anything runs; if it is not
 // allowed the status is noshell.
-const Script = `s=$1; m=$2; shift 2; ` +
+const Script = scriptHead + scriptPassword
+
+// TouchIDScript replaces Script on this computer when sudo's PAM
+// configuration accepts Touch ID (pam_tid.so; see TouchIDEnabled). psudo then
+// shows no dialog of its own and sends no password: sudo -v, with nothing on
+// stdin, makes pam_tid show the system's Touch ID sheet, which also offers
+// the account password ("Use Password…"). Then sudo -n -v checks that -v left
+// a ticket ("<marker> noticket" if not), sudo -l checks that sudoers allows
+// this exact command ("<marker> denied" if not), as in Script, the script
+// reports "<marker> touchid", and the command runs on that ticket, with stdin
+// closed.
+//
+// When the sheet is cancelled, or cannot be shown (no desktop session), PAM
+// falls through to a password that -S cannot read from /dev/null: -v fails
+// and the script reports "<marker> tidfail". A psudo password dialog after
+// that would only ask again what the sheet already offered. It would not even
+// work: with pam_tid first in PAM, every sudo -S of Script shows the sheet
+// before it reads the password.
+const TouchIDScript = scriptHead + scriptTouchID
+
+const scriptTouchID = `"$s" -k; ` +
+	`if ! LC_ALL=C "$s" -S -p '' -v </dev/null >/dev/null 2>&1; then printf '%s tidfail\n' "$m"; exit 1; fi; ` +
+	`if ! "$s" -n -v 2>/dev/null; then "$s" -k; printf '%s noticket\n' "$m"; exit 1; fi; ` +
+	`if ! "$s" -n -l -- "$@" >/dev/null 2>&1; then "$s" -k; printf '%s denied\n' "$m"; exit 1; fi; ` +
+	`printf '%s touchid\n' "$m"; exec </dev/null; "$s" -n -- "$@"; rc=$?; "$s" -k; exit "$rc"`
+
+const scriptHead = `s=$1; m=$2; shift 2; ` +
 	`if [ "$(id -u 2>/dev/null)" = 0 ]; then printf '%s root\n' "$m"; exec </dev/null; exec "$@"; fi; ` +
 	`if [ -z "$s" ]; then for c in /usr/bin/sudo /bin/sudo /usr/local/bin/sudo /run/wrappers/bin/sudo /run/current-system/sw/bin/sudo; do if [ -x "$c" ]; then s=$c; break; fi; done; fi; ` +
 	`if [ -z "$s" ]; then echo 'psudo: sudo not found on target' >&2; printf '%s nosudo\n' "$m"; exit 1; fi; ` +
 	`if LC_ALL=C "$s" -n -l -l -- "$@" </dev/null 2>/dev/null | ` +
 	`awk '/^(Sudoers entry|LDAP Role)/{a=0} /^ *Options:.*!authenticate/{a=1} /^ *Matched:/{if(a)f=1} END{exit !f}'; ` +
-	`then printf '%s nopw\n' "$m"; exec </dev/null; "$s" -n -- "$@"; exit; fi; ` +
-	`printf '%s ready\n' "$m"; IFS= read -r p || exit 1; exec </dev/null; ` +
+	`then printf '%s nopw\n' "$m"; exec </dev/null; "$s" -n -- "$@"; exit; fi; `
+
+const scriptPassword = `printf '%s ready\n' "$m"; IFS= read -r p || exit 1; exec </dev/null; ` +
 	`"$s" -k; ` +
 	`f=$(mktemp 2>/dev/null) || f=/dev/null; ` +
 	`if printf '%s\n' "$p" | LC_ALL=C "$s" -S -p '' -v 2>"$f"; then t=ok; else ` +
@@ -124,6 +151,9 @@ const (
 	statusNoShell  = "noshell"
 	statusNoPW     = "nopw"
 	statusRoot     = "root"
+	statusTouchID  = "touchid"
+	statusTIDFail  = "tidfail"
+	statusNoTicket = "noticket"
 )
 
 // maxPreamble bounds output (such as login banners) accepted before the marker.
@@ -148,6 +178,12 @@ type Runner struct {
 	// ReadyTimeout is how long to wait for the script to report that it is
 	// running before giving up without sending anything. 0 means DefaultReadyWait.
 	ReadyTimeout time.Duration
+
+	// TouchID reports whether sudo on this computer accepts Touch ID; nil
+	// means it does not. Then a local command authenticates with the
+	// system's Touch ID sheet only (TouchIDScript), and the password cache
+	// is not used.
+	TouchID func() bool
 
 	// Password cache for local targets. A nil Store disables caching.
 	Store func() (cache.Store, error)
@@ -276,7 +312,9 @@ func (r *Runner) Run(ctx context.Context, host string, argv []string) int {
 	ttl := 0
 	var password []byte
 	fromCache := false
-	if !remote && r.Store != nil {
+	// With Touch ID there is no password to keep: the sheet authenticates.
+	touchID := !remote && r.TouchID != nil && r.TouchID()
+	if !remote && !touchID && r.Store != nil {
 		unlock, err := r.Lock()
 		if err != nil {
 			r.fail("could not lock the password cache")
@@ -329,7 +367,11 @@ func (r *Runner) Run(ctx context.Context, host string, argv []string) int {
 		cmd = exec.Command(r.SSH, SSHArgs(host, RemoteCommand(r.RemoteSudo, marker, argv), sshOpts...)...)
 		cmd.Env = r.SSHEnv
 	} else {
-		cmd = exec.Command(r.Shell, append([]string{"-c", Script, "psudo", r.LocalSudo, marker}, argv...)...)
+		script := Script
+		if touchID {
+			script = TouchIDScript
+		}
+		cmd = exec.Command(r.Shell, append([]string{"-c", script, "psudo", r.LocalSudo, marker}, argv...)...)
 		cmd.Env = r.LocalEnv
 	}
 	cmd.Stderr = r.Stderr
@@ -360,10 +402,10 @@ func (r *Runner) Run(ctx context.Context, host string, argv []string) int {
 	timer := time.AfterFunc(r.ReadyWait(), func() { cmd.Process.Kill() })
 	status, overflow := r.awaitStatus(reader, marker)
 	timer.Stop()
-	if (status == statusNoPW || status == statusRoot) && !overflow {
-		// The account is root, or sudoers lets this exact command run
-		// without a password, so there is nothing to ask: no dialog, and
-		// nothing is written to stdin.
+	if (status == statusNoPW || status == statusRoot || status == statusTouchID) && !overflow {
+		// The account is root, sudoers lets this exact command run without
+		// a password, or Touch ID authenticated it, so there is nothing to
+		// ask: no dialog, and nothing is written to stdin.
 		stdin.Close()
 		zero(password)
 		release()
@@ -443,6 +485,13 @@ func (r *Runner) Run(ctx context.Context, host string, argv []string) int {
 		r.fail("AUTHENTICATION FAILED: the password was accepted, but %s does not keep sudo's credential between commands "+
 			"and its sudoers does not allow /bin/sh, which psudo needs there. The command was not run. "+
 			"Fix on the target: allow the account to run /bin/sh via sudo, or set timestamp_timeout above 0.", target)
+	case status == statusTIDFail:
+		r.fail("CANCELLED: Touch ID (or the password in its sheet) did not authenticate; it was cancelled, or no desktop " +
+			"session can show it. The command was not run.")
+		return ExitCancelled
+	case status == statusNoTicket:
+		r.fail("AUTHENTICATION FAILED: Touch ID worked, but sudo on this computer keeps no credential between commands " +
+			"(timestamp_timeout is 0), which psudo needs with Touch ID. The command was not run.")
 	case status == statusNoSudo:
 		r.fail("NO SUDO: sudo is not installed on %s, and the account psudo logged in as is not root. The command "+
 			"was not run. If root may log in to that host, run it again with -H root@<host>.", target)
