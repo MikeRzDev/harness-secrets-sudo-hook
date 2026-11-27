@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/MikeRzDev/harness-secrets-sudo-hook/internal/envfile"
 	"github.com/MikeRzDev/harness-secrets-sudo-hook/internal/proc"
@@ -49,6 +50,32 @@ func lookup(places []Place, name string) (Place, error) {
 	return nil, nil
 }
 
+// StoreName is the name under which the value of the secret with this key is
+// kept in the OS credential store. A host may contain characters an entry
+// name cannot (dots, quotes), so the host part is in hex: ollama-api-key@dev
+// is kept as ollama-api-key@646576.
+func StoreName(key string) string {
+	name, host := SplitKey(key)
+	if host == "" {
+		return name
+	}
+	return name + "@" + hex.EncodeToString([]byte(host))
+}
+
+// KeyOfStore is the reverse of StoreName; ok is false for a name StoreName
+// cannot have made.
+func KeyOfStore(stored string) (string, bool) {
+	name, h, scoped := strings.Cut(stored, "@")
+	if !scoped {
+		return name, ValidName(name)
+	}
+	host, err := hex.DecodeString(h)
+	if err != nil || hex.EncodeToString(host) != h || !ValidKey(HostKey(name, string(host))) {
+		return "", false
+	}
+	return HostKey(name, string(host)), true
+}
+
 // --- the OS credential store
 
 type securePlace struct {
@@ -71,9 +98,9 @@ func (s *securePlace) Note(string) string {
 	return "kept for every project and every session, until you delete it. The agent is not given the value."
 }
 
-func (s *securePlace) Has(name string) (bool, error)       { return s.v.Has(name) }
-func (s *securePlace) Get(name string) ([]byte, error)     { return s.v.Get(name) }
-func (s *securePlace) Put(name string, value []byte) error { return s.v.Put(name, value) }
+func (s *securePlace) Has(name string) (bool, error)       { return s.v.Has(StoreName(name)) }
+func (s *securePlace) Get(name string) ([]byte, error)     { return s.v.Get(StoreName(name)) }
+func (s *securePlace) Put(name string, value []byte) error { return s.v.Put(StoreName(name), value) }
 
 // --- the session
 
@@ -162,9 +189,11 @@ func (s *sessionPlace) Note(string) string {
 	return "psudo forgets it when this " + s.what + " session ends. The agent is not given the value."
 }
 
-func (s *sessionPlace) Has(name string) (bool, error)       { return s.v.Has(s.prefix + name) }
-func (s *sessionPlace) Get(name string) ([]byte, error)     { return s.v.Get(s.prefix + name) }
-func (s *sessionPlace) Put(name string, value []byte) error { return s.v.Put(s.prefix+name, value) }
+func (s *sessionPlace) Has(name string) (bool, error)   { return s.v.Has(s.prefix + StoreName(name)) }
+func (s *sessionPlace) Get(name string) ([]byte, error) { return s.v.Get(s.prefix + StoreName(name)) }
+func (s *sessionPlace) Put(name string, value []byte) error {
+	return s.v.Put(s.prefix+StoreName(name), value)
+}
 
 // SessionNames returns the secrets kept for session s.
 func SessionNames(v vault.Vault, s Session) ([]string, error) {
@@ -176,7 +205,9 @@ func SessionNames(v vault.Vault, s Session) ([]string, error) {
 	for _, e := range entries {
 		m := sessionEntryRe.FindStringSubmatch(e)
 		if m != nil && m[1] == strconv.Itoa(s.PID) && m[2] == sessionKey(s.Harness, s.ID) {
-			names = append(names, m[3])
+			if key, ok := KeyOfStore(m[3]); ok {
+				names = append(names, key)
+			}
 		}
 	}
 	return names, nil
@@ -184,7 +215,7 @@ func SessionNames(v vault.Vault, s Session) ([]string, error) {
 
 // ForgetSession removes one secret of session s.
 func ForgetSession(v vault.Vault, s Session, name string) error {
-	return v.Delete(fmt.Sprintf("%d-%s-%s", s.PID, sessionKey(s.Harness, s.ID), name))
+	return v.Delete(fmt.Sprintf("%d-%s-%s", s.PID, sessionKey(s.Harness, s.ID), StoreName(name)))
 }
 
 // EndSession removes what was kept for the session with this id, and for
@@ -246,13 +277,15 @@ func (p *projectPlace) file() string {
 func (p *projectPlace) Name() string { return filepath.Base(p.file()) }
 
 func (p *projectPlace) Note(secret string) string {
-	key, _ := envfile.Key(secret)
+	key, _ := ownVar(secret)
 	return "saved as " + key + " in " + shquote.VisibleLine(p.file()) +
 		". Git ignores that file, but it is plain text: the agent, and anything else that reads the project, can read the value."
 }
 
+// The env file is the project's: its variable for a secret is the same for
+// every host, as it was before secrets belonged to hosts.
 func (p *projectPlace) find(name string) ([]byte, bool) {
-	key, ok := envfile.Key(name)
+	key, ok := ownVar(name)
 	if !ok {
 		return nil, false
 	}
@@ -278,9 +311,13 @@ func (p *projectPlace) Get(name string) ([]byte, error) {
 }
 
 // CanSave reports whether a value for name can be written to the env file.
+//
+// A host's own secret is not saved there: the file has one variable for every
+// host, so the value would reach the other hosts too.
 func (p *projectPlace) CanSave(name string) bool {
+	_, host := SplitKey(name)
 	_, ok := envfile.Key(name)
-	return ok && p.project.Save != ""
+	return ok && host == "" && p.project.Save != ""
 }
 
 func (p *projectPlace) Put(name string, value []byte) error {

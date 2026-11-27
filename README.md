@@ -343,6 +343,8 @@ them for you. Edit them to widen or narrow access:
 | `confirm` | `false` | `true` asks before each use (Deny / Allow once). By default an allowed program gets the secret without a dialog. |
 | `remember_seconds` | `0` | Offer "Allow for N min" for exactly the same command (max 86400) |
 
+**Each SSH host has its own secrets.** Two hosts can use the same secret name with different values. psudo tells them apart by the `-H` argument as given. If the rule for `ollama-api-key` lists only `maxwell-bob`, then `psudo -H android-dev --secret OLLAMA_API_KEY=ollama-api-key …` is a request for a different secret, `ollama-api-key@android-dev`. psudo asks you for its value and adds a rule under that key, which has no `local` or `ssh_hosts` field. To share one value between hosts on purpose, list them all in the plain rule's `ssh_hosts`. See [docs/secrets.md](docs/secrets.md) §5.3.
+
 **More forms the agent uses:**
 
 ```sh

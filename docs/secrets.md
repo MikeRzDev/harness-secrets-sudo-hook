@@ -114,6 +114,22 @@ Rules live in harness-secrets-sudo-hook's existing config file (`~/.config/harne
 
 Unknown fields and wrong types make the config invalid, and then every secret request fails closed, as the cache does today. The rules are shown to the user for approval, so every command and host in them must be plain text on one line: no control characters, no invisible or direction-changing characters, at most 1024 bytes per command and 64 entries per list. Anything else is also an invalid config.
 
+**Each SSH host has its own secrets.** Several hosts may name a secret the same way and hold different values under that name: `ollama-api-key` on `maxwell-bob` is not the one on `android-dev`. psudo knows which host a request is for from its `-H` argument, and it uses that argument as given: `android-dev`, `root@android-dev` and `192.168.8.20` are three hosts to psudo, even when they reach the same machine. With `-H host`, the secret called `name` is:
+
+1. `name@host`, the host's own secret, when the config has a rule under that key;
+2. otherwise `name`, when its rule lists the host in `ssh_hosts` (one value shared on purpose);
+3. otherwise `name@host` when `name` has a rule: that rule is for other hosts, so this host gets a secret of its own. psudo asks the user for its value in the Secret needed dialog and adds a rule for it, instead of refusing the request;
+4. with no rule at all, `name` when a value is already kept under that plain name, for example one stored with `--secret-set` (the dialog offers to add a rule for it, as before), and `name@host` otherwise.
+
+A rule for a host's own secret takes its host from its key, so it has no `local` or `ssh_hosts` field:
+
+```json
+"ollama-api-key": { "commands": ["/home/bob/.local/bin/hermes-env-store"], "local": false, "ssh_hosts": ["maxwell-bob"] },
+"ollama-api-key@android-dev": { "commands": ["/home/dev/.local/bin/hermes-env-store"], "vars": ["OLLAMA_API_KEY"] }
+```
+
+A host's own secret goes into the same variables as the plain name (`OLLAMA_API_KEY` by default), and psudo reads it from the project's env file under that variable too. psudo never saves one in the env file, though: the file has one variable for every host, so the value would reach the other hosts as well. `--secret-list`, `--secret-set=name@host` and `--secret-delete=name@host` show and take the key.
+
 Locally, harness-secrets-sudo-hook resolves a bare command name only through the trusted directories, never through the caller's `PATH`, and runs that resolved file. A relative path (`./gh`) is refused. On an SSH host, harness-secrets-sudo-hook cannot inspect the host's files: a bare name runs through the remote `PATH`, and an absolute path must match an absolute entry.
 
 ### 5.4 Execution
@@ -227,7 +243,7 @@ An env file is plain text. harness-secrets-sudo-hook still delivers and redacts 
 
 | | macOS Keychain | Linux Secret Service |
 | --- | --- | --- |
-| Secret | generic password, service `harness-root-hook.secret.<name>` | attributes `application=harness-root-hook kind=secret name=<name> account=<user>` |
+| Secret | generic password, service `harness-root-hook.secret.<name>`; a host's own secret is `<name>@<host in hex>`, because a host can contain dots and quotes | attributes `application=harness-root-hook kind=secret name=<name> account=<user>` |
 | Session secret | service `harness-root-hook.session.<pid>-<hash>-<name>` | `kind=session name=<pid>-<hash>-<name>` |
 | Approvals | service `harness-root-hook.approvals.<harness>` | `kind=approvals name=<harness>` |
 | Approved rules hash | service `harness-root-hook.approvals.rules` | `kind=approvals name=rules` |
@@ -275,6 +291,7 @@ harness-secrets-sudo-hook replaces each secret in the command's stdout and stder
 | The chosen place cannot take the value (the store fails, or git no longer ignores the env file) | 254, the command did not run |
 | No rule for the secret | the dialog offers to add the narrowest rule; Deny is 251 |
 | Command or host not allowed by an existing rule, or a forbidden program | 253, naming the field the user would have to change |
+| A rule for the name exists, but for other SSH hosts | the host gets its own secret `name@host`: the Secret needed dialog asks for its value |
 | Config invalid | 253, `invalid secrets rules in config.json` |
 | Rules changed and the user denies them | 251 |
 | User clicks Deny, or the dialog times out | 251 |

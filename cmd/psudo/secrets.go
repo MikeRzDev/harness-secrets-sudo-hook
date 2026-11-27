@@ -187,8 +187,9 @@ func secretAdmin(name, value string, stdin io.Reader, stdout, stderr io.Writer) 
 			fmt.Fprintln(stderr, "psudo: --secret-list takes no value")
 			return runner.ExitUsage
 		}
-	} else if !secrets.ValidName(value) {
-		fmt.Fprintf(stderr, "psudo: --%s=<name>: secret names use a-z, 0-9, _ and - (up to 63 characters)\n", name)
+	} else if !secrets.ValidKey(value) {
+		fmt.Fprintf(stderr, "psudo: --%s=<name>: secret names use a-z, 0-9, _ and - (up to 63 characters); "+
+			"<name>@<ssh host> is the secret of one host\n", name)
 		return runner.ExitUsage
 	}
 	v, err := vault.New("secret")
@@ -277,9 +278,13 @@ func (c *secretCmd) list() int {
 		return c.storeFail()
 	}
 	lasting := map[string]bool{}
-	names := append([]string(nil), stored...)
-	for _, n := range stored {
-		lasting[n] = true
+	var names []string
+	for _, s := range stored {
+		// A host's own secret is kept under a name with the host in hex.
+		if n, ok := secrets.KeyOfStore(s); ok {
+			names = append(names, n)
+			lasting[n] = true
+		}
 	}
 	for n := range session {
 		if !lasting[n] {
@@ -313,7 +318,7 @@ func (c *secretCmd) list() int {
 }
 
 func (c *secretCmd) remove(name string) int {
-	ok, err := c.vault.Has(name)
+	ok, err := c.vault.Has(secrets.StoreName(name))
 	if err != nil {
 		return c.storeFail()
 	}
@@ -328,7 +333,7 @@ func (c *secretCmd) remove(name string) int {
 	if code := c.confirm("Delete the stored secret \""+name+"\"?\n\nThis cannot be undone.", "Delete"); code != 0 {
 		return code
 	}
-	if ok && c.vault.Delete(name) != nil {
+	if ok && c.vault.Delete(secrets.StoreName(name)) != nil {
 		return c.storeFail()
 	}
 	if session[name] && c.forget(name) != nil {
@@ -339,7 +344,7 @@ func (c *secretCmd) remove(name string) int {
 }
 
 func (c *secretCmd) store(fromStdin bool, name string) int {
-	exists, err := c.vault.Has(name)
+	exists, err := c.vault.Has(secrets.StoreName(name))
 	if err != nil {
 		return c.storeFail()
 	}
@@ -387,7 +392,7 @@ func (c *secretCmd) store(fromStdin bool, name string) int {
 		}
 		value = v
 	}
-	if err := c.vault.Put(name, value); err != nil {
+	if err := c.vault.Put(secrets.StoreName(name), value); err != nil {
 		return c.storeFail()
 	}
 	fmt.Fprintf(c.stdout, "psudo: stored secret %s\n", name)

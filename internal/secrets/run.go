@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/MikeRzDev/harness-secrets-sudo-hook/internal/cache"
-	"github.com/MikeRzDev/harness-secrets-sudo-hook/internal/envfile"
 	"github.com/MikeRzDev/harness-secrets-sudo-hook/internal/prompt"
 	"github.com/MikeRzDev/harness-secrets-sudo-hook/internal/runner"
 	"github.com/MikeRzDev/harness-secrets-sudo-hook/internal/shquote"
@@ -166,6 +165,14 @@ func (r *Runner) Run(ctx context.Context, req Request) int {
 	if err != nil {
 		r.fail("NOT ALLOWED: %v. No secret was used and the command was not run.", err)
 		return ExitNotAllowed
+	}
+	// On an SSH host, a name may stand for that host's own secret. From here
+	// on, every rule, value and dialog uses the key Scope picks.
+	if req.Host != "" {
+		var code int
+		if req, code = r.scope(policy, req); code != 0 {
+			return code
+		}
 	}
 	// A secret with no rule gets the narrowest rule for this request, offered
 	// to the user below. Everything else in Check still applies to it.
@@ -341,6 +348,44 @@ func (r *Runner) Run(ctx context.Context, req Request) int {
 	return r.remote(ctx, req, values, stdout, stderr)
 }
 
+// scope returns req with each secret name replaced by its key on req.Host
+// (see Scope), or a nonzero exit code.
+func (r *Runner) scope(p Policy, req Request) (Request, int) {
+	var places []Place
+	opened := false
+	stored := func(key string) (bool, error) {
+		if !opened {
+			opened = true
+			v, err := r.Vault()
+			if err != nil {
+				return false, err
+			}
+			places = []Place{Secure(v, r.SecureName)}
+			if r.Session != nil {
+				places = append(places, r.Session())
+			}
+		}
+		p, err := lookup(places, key)
+		return p != nil, err
+	}
+	keys := map[string]string{}
+	for _, n := range Names(req.Uses) {
+		key, err := Scope(p, req.Host, n, stored)
+		if err != nil {
+			r.fail("the OS credential store is unavailable. The command was not run.")
+			return req, ExitStore
+		}
+		keys[n] = key
+	}
+	uses := make([]Use, len(req.Uses))
+	for i, u := range req.Uses {
+		u.Name = keys[u.Name]
+		uses[i] = u
+	}
+	req.Uses = uses
+	return req, 0
+}
+
 // pinProgram checks that the program about to receive stored secrets is the
 // file it was when the user allowed it (see pins.go), and asks when it is
 // not. The first use of a program is remembered without a question.
@@ -419,6 +464,11 @@ func (r *Runner) obtain(ctx context.Context, st *stores, req Request, name strin
 	note := ""
 	if adding {
 		note = "\n\n" + ruleNote(r.ConfigPath, name, rule)
+	}
+	if plain, host := SplitKey(name); host != "" {
+		// Say why a name psudo may already have a value for is asked for again.
+		note += "\n\nEach SSH host has its own secrets: this is the value of \"" + plain + "\" for " +
+			shquote.VisibleLine(host) + " only. Another host's \"" + plain + "\" is a different secret."
 	}
 	if st.from[name] != nil {
 		_, code, ok := r.ask(ctx, prompt.Choice{Title: r.Title,
@@ -556,7 +606,7 @@ func RulesMessage(path string, p Policy, approved map[string]string) string {
 		}
 		vars := strings.Join(rule.Vars, ", ")
 		if vars == "" {
-			vars, _ = envfile.Key(name)
+			vars, _ = ownVar(name)
 		}
 		fmt.Fprintf(&b, "\n%s%s\n  commands: %s\n  as: %s\n  hosts: %s\n  %s\n", name, label[name],
 			strings.Join(rule.Commands, ", "), vars, strings.Join(hosts, ", "), ask)

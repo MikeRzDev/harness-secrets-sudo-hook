@@ -1375,3 +1375,102 @@ func TestRulesMessageShowsWhatChanged(t *testing.T) {
 		t.Fatalf("without a record every rule is listed:\n%s", msg)
 	}
 }
+
+// remoteRun is fixture.run for a request on an SSH host.
+func (f *fixture) remoteRun(req Request) int {
+	f.stdout.Reset()
+	f.stderr.Reset()
+	f.chosen, f.asked = nil, nil
+	code := remoteRunner(f).Run(context.Background(), req)
+	data, _ := os.ReadFile(f.cfg)
+	f.policy = string(data)
+	return code
+}
+
+// Two hosts may each have a secret of the same name with values of their
+// own. A rule that gives the name to one host must not refuse the other: the
+// other host gets its own secret, asked for in a dialog, and the first host's
+// value never goes there.
+func TestEachHostHasItsOwnSecretOfAName(t *testing.T) {
+	f := newFixture(t)
+	// "tok" is stored and allowed on "remote" only, as ollama-api-key was on one host.
+	other := Request{Host: "other", Dir: "/w", Uses: []Use{{Var: "TOKEN", Name: "tok"}}, Argv: []string{f.tool}}
+	f.answer = []int{1, 1} // approve the rules; keep the value in the Keychain
+	f.typed = []string{"other-host-value-1234"}
+	if code := f.remoteRun(other); code != 7 {
+		t.Fatalf("exit %d\n%s", code, f.stderr.String())
+	}
+	f.noLeak() // the value of "remote"'s tok never reached "other"
+	if len(f.asked) != 1 || !strings.Contains(f.asked[0].Text, "tok@other  as TOKEN") ||
+		!strings.Contains(f.asked[0].Text, "Each SSH host has its own secrets") {
+		t.Fatalf("asked %+v", f.asked)
+	}
+	if !strings.Contains(f.stdout.String(), "raw: [REDACTED:tok@other]") {
+		t.Fatalf("output %q", f.stdout.String())
+	}
+	if string(f.v.m["tok@"+fmt.Sprintf("%x", "other")]) != "other-host-value-1234" || string(f.v.m["tok"]) != value {
+		t.Fatalf("store %q", f.v.m)
+	}
+	p := mustPolicy(t, f.policy)
+	if r := p["tok@other"]; r.Local || len(r.SSHHosts) != 1 || r.SSHHosts[0] != "other" || r.Commands[0] != f.tool ||
+		strings.Contains(f.policy, `"ssh_hosts": ["other"]`) {
+		t.Fatalf("rule %+v\n%s", r, f.policy)
+	}
+	if r := p["tok"]; len(r.SSHHosts) != 1 || r.SSHHosts[0] != "remote" {
+		t.Fatalf("the other host's rule changed: %+v", r)
+	}
+	// Later uses on "other" need no dialog: psudo has its value and its rule.
+	if code := f.remoteRun(other); code != 7 || len(f.chosen)+len(f.asked) != 0 ||
+		!strings.Contains(f.stdout.String(), "[REDACTED:tok@other]") {
+		t.Fatalf("second use: %d %d %s", code, len(f.chosen)+len(f.asked), f.stderr.String())
+	}
+	// "remote" still gets its own value, through its own rule.
+	f.answer = []int{1} // its rule asks before each use
+	shared := Request{Host: "remote", Dir: "/w", Uses: []Use{{Var: "TOKEN", Name: "tok"}}, Argv: []string{f.tool}}
+	if code := f.remoteRun(shared); code != 7 || !strings.Contains(f.stdout.String(), "raw: [REDACTED:tok]") || len(f.asked) != 0 {
+		t.Fatalf("remote: %d %s", code, f.stderr.String())
+	}
+}
+
+func TestScope(t *testing.T) {
+	p := Policy{"a": {Commands: []string{"x"}, SSHHosts: []string{"h1"}}, "b@h2": {Commands: []string{"x"}, SSHHosts: []string{"h2"}}}
+	none := func(string) (bool, error) { return false, nil }
+	stored := func(string) (bool, error) { return true, nil }
+	for _, c := range []struct {
+		host, name string
+		has        func(string) (bool, error)
+		want       string
+	}{
+		{"", "a", none, "a"},                // this computer
+		{"h1", "a", none, "a"},              // shared with h1 by its rule
+		{"h2", "a", none, "a@h2"},           // the rule is for other hosts
+		{"h2", "b", none, "b@h2"},           // h2's own rule
+		{"h3", "c", none, "c@h3"},           // nothing anywhere: the host's own
+		{"h3", "c", stored, "c"},            // stored without a rule: offered as before
+		{"root@h1", "a", none, "a@root@h1"}, // the host is -H as given
+	} {
+		if got, err := Scope(p, c.host, c.name, c.has); err != nil || got != c.want {
+			t.Errorf("Scope(%q, %q) = %q %v, want %q", c.host, c.name, got, err, c.want)
+		}
+	}
+	for _, k := range []string{"a@h", "a@root@h.example.com", "a@192.168.8.20"} {
+		if !ValidKey(k) {
+			t.Errorf("%q rejected", k)
+		}
+		if back, ok := KeyOfStore(StoreName(k)); !ok || back != k || strings.ContainsAny(StoreName(k), ".\"") {
+			t.Errorf("%q stored as %q, read back %q %v", k, StoreName(k), back, ok)
+		}
+	}
+	for _, k := range []string{"a@", "a@-oX", "a@h b", "A@h", "@h"} {
+		if ValidKey(k) {
+			t.Errorf("%q accepted", k)
+		}
+	}
+	// A rule for one host's secret takes its host from the name.
+	if _, err := ParsePolicy([]byte(`{"secrets":{"a@h":{"commands":["x"],"ssh_hosts":["other"]}}}`)); !errors.Is(err, ErrConfig) {
+		t.Errorf("ssh_hosts in a host's rule: %v", err)
+	}
+	if r := mustPolicy(t, `{"secrets":{"a@h":{"commands":["x"]}}}`)["a@h"]; r.Local || len(r.SSHHosts) != 1 || r.SSHHosts[0] != "h" {
+		t.Errorf("host rule %+v", r)
+	}
+}

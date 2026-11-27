@@ -36,6 +36,79 @@ var (
 // ValidName reports whether name is a valid secret name.
 func ValidName(name string) bool { return nameRe.MatchString(name) }
 
+// Several SSH hosts may each have a secret of the same name, with values of
+// their own: an "ollama-api-key" on one host is not the one on another. So a
+// secret used with -H is, unless its rule shares it with that host, the
+// host's own secret, kept and ruled under the key "<name>@<host>". The host
+// is the -H argument as given. A name never contains "@", so the first one
+// separates the two, and a host may contain more (root@dev).
+
+// HostKey is the key of the secret called name that belongs to host.
+func HostKey(name, host string) string { return name + "@" + host }
+
+// SplitKey returns the secret name and the host of a key; host is "" for a
+// secret that belongs to no single host.
+func SplitKey(key string) (name, host string) {
+	name, host, _ = strings.Cut(key, "@")
+	return name, host
+}
+
+// ValidKey reports whether key is a valid secret name, or a valid name with
+// the host it belongs to.
+func ValidKey(key string) bool {
+	name, host, scoped := strings.Cut(key, "@")
+	return ValidName(name) && (!scoped || validHost(host))
+}
+
+func validHost(h string) bool { return len(h) <= maxHostLen && runner.ValidHost(h) && plain(h) }
+
+// ownVar is the variable a secret goes into when its rule has no vars: the
+// name in upper case with "_" for "-", whatever host the secret belongs to.
+func ownVar(key string) (string, bool) {
+	name, _ := SplitKey(key)
+	return envfile.Key(name)
+}
+
+// Scope returns the key of the secret called name for a request on host.
+//
+//   - On this computer it is the name itself.
+//   - A rule for the host's own secret ("<name>@<host>") picks that one.
+//   - A rule for the name that lists the host in ssh_hosts shares that
+//     secret with the host, as before.
+//   - A rule for the name that does not list the host belongs to other
+//     hosts: this host gets a secret of its own, which psudo asks the user
+//     for, instead of a refusal.
+//   - With no rule at all, a value stored under the plain name (with
+//     --secret-set, say) is offered for this host, as before; otherwise the
+//     new secret is the host's own, so that another host can later have one
+//     under the same name.
+//
+// stored reports whether a value is kept under a key in the session or the
+// OS credential store; it is called only in the last case.
+func Scope(p Policy, host, name string, stored func(key string) (bool, error)) (string, error) {
+	if host == "" {
+		return name, nil
+	}
+	own := HostKey(name, host)
+	if _, ok := p[own]; ok {
+		return own, nil
+	}
+	if rule, ok := p[name]; ok {
+		if slices.Contains(rule.SSHHosts, host) {
+			return name, nil
+		}
+		return own, nil
+	}
+	ok, err := stored(name)
+	if err != nil {
+		return "", err
+	}
+	if ok {
+		return name, nil
+	}
+	return own, nil
+}
+
 // reservedVars and reservedPrefixes are variables that make a program load
 // code, run another program or read its settings from somewhere else: the
 // loader, shells, interpreters, git, npm, pagers and editors. A value put in
@@ -112,7 +185,7 @@ func (r Rule) allowsVar(name, v string) bool {
 	if len(r.Vars) > 0 {
 		return slices.Contains(r.Vars, v)
 	}
-	own, ok := envfile.Key(name)
+	own, ok := ownVar(name)
 	return ok && v == own
 }
 
@@ -139,8 +212,8 @@ func ParsePolicy(data []byte) (Policy, error) {
 	}
 	p := Policy{}
 	for name, body := range entries {
-		if !ValidName(name) {
-			return nil, fmt.Errorf("%w: %q is not a valid secret name", ErrConfig, name)
+		if !ValidKey(name) {
+			return nil, fmt.Errorf("%w: %q is not a valid secret name (or <name>@<ssh host>)", ErrConfig, name)
 		}
 		rule, err := parseRule(name, body)
 		if err != nil {
@@ -170,8 +243,13 @@ func parseRule(name string, body json.RawMessage) (Rule, error) {
 	// confirm is false unless the rule says otherwise: a program the rule
 	// lists gets the secret without a dialog before each use.
 	r := Rule{Local: true}
+	_, host := SplitKey(name)
 	for key, value := range fields {
 		var err error
+		if host != "" && (key == "local" || key == "ssh_hosts") {
+			// A host's own secret is used on that host only: the name says so.
+			return bad("%s is not used in a rule for one host's secret; the host comes from the name", key)
+		}
 		switch key {
 		case "commands":
 			err = json.Unmarshal(value, &r.Commands)
@@ -194,6 +272,9 @@ func parseRule(name string, body json.RawMessage) (Rule, error) {
 		if err != nil {
 			return bad("%s has the wrong type", key)
 		}
+	}
+	if host != "" {
+		r.Local, r.SSHHosts = false, []string{host}
 	}
 	if err := r.Validate(); err != nil {
 		return bad("%v", err)
@@ -247,7 +328,7 @@ func (r Rule) Validate() error {
 		}
 	}
 	for _, h := range r.SSHHosts {
-		if len(h) > maxHostLen || !runner.ValidHost(h) {
+		if !validHost(h) {
 			return fmt.Errorf("ssh host %q is not valid", h)
 		}
 	}
@@ -475,7 +556,7 @@ func Check(p Policy, req Request, find func(string) string) (Decision, error) {
 				return Decision{}, refuse("secret %q may not be put in %s (its rule's vars allow: %s)", u.Name, u.Var,
 					strings.Join(rule.Vars, ", "))
 			}
-			own, _ := envfile.Key(u.Name)
+			own, _ := ownVar(u.Name)
 			return Decision{}, refuse("secret %q may not be put in %s (its rule has no \"vars\", so only %s is allowed)",
 				u.Name, u.Var, own)
 		}

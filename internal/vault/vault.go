@@ -207,7 +207,7 @@ func (k *Keychain) List() ([]string, error) {
 	if err != nil || res.Code != 0 {
 		return nil, ErrStore
 	}
-	re := regexp.MustCompile(`"svce"<blob>="harness-root-hook\.` + regexp.QuoteMeta(k.Kind) + `\.([a-z0-9][a-z0-9_-]*)"`)
+	re := regexp.MustCompile(`"svce"<blob>="harness-root-hook\.` + regexp.QuoteMeta(k.Kind) + `\.([a-z0-9][a-z0-9_@-]*)"`)
 	return unique(re.FindAllStringSubmatch(res.Stdout, -1)), nil
 }
 
@@ -311,6 +311,6 @@ func (s *SecretService) List() ([]string, error) {
 		return nil, ErrStore
 	}
 	// search prints attributes on stdout or stderr depending on the version.
-	re := regexp.MustCompile(`(?m)^attribute\.name = ([a-z0-9][a-z0-9_-]*)$`)
+	re := regexp.MustCompile(`(?m)^attribute\.name = ([a-z0-9][a-z0-9_@-]*)$`)
 	return unique(re.FindAllStringSubmatch(res.Stdout+"\n"+res.Stderr, -1)), nil
 }

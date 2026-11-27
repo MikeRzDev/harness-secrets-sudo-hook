@@ -205,6 +205,8 @@ func SessionContext(psudo string, codex bool) string {
 		"Never ask the user to run psudo or edit its config themselves. " +
 		"Never ask the user for a secret in chat, and never read one yourself from the OS credential store or from an env file. " +
 		"Keep using the variable a secret was first used with: its rule names it, and another one is refused. " +
+		"Each SSH host has its own secrets: the same name used with another -H host is a separate secret, and psudo asks " +
+		"the user for its value instead of reusing another host's (--secret-list shows it as name@host). " +
 		"A value from an env file cannot be combined with a stored secret in one command. " +
 		"Exit 253: the user's rules do not allow that use; tell the user which rule is missing rather than finding another way."
 	if codex {

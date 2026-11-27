@@ -77,10 +77,12 @@ func AddRules(path string, rules map[string]Rule) error {
 			}
 			entry.Set("vars", vars)
 		}
-		if !r.Local {
+		// A rule for one host's secret names its host in the key.
+		_, host := SplitKey(name)
+		if !r.Local && host == "" {
 			entry.Set("local", false)
 		}
-		if len(r.SSHHosts) > 0 {
+		if len(r.SSHHosts) > 0 && host == "" {
 			hosts := make([]any, len(r.SSHHosts))
 			for i, h := range r.SSHHosts {
 				hosts[i] = h
