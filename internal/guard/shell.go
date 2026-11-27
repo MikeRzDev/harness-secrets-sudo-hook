@@ -76,7 +76,11 @@ type simpleCmd struct {
 	input    bool     // a < redirection: the program reads stdin
 	// pattern marks a command that ends at ")": in case x in *.md|*) …,
 	// the words before ")" are patterns, not programs.
-	pattern    bool
+	pattern bool
+	// parsed marks a shell or ssh whose code verdict parsed and judged, and
+	// code holds the start of each word it judged as code.
+	parsed     bool
+	code       map[int]bool
 	scope      *scope
 	start, end int // its place in the source, redirections included
 }
@@ -289,7 +293,9 @@ var (
 		"caffeinate": true, "watch": true, "chrt": true, "taskset": true, "unbuffer": true, "doas": true,
 		"find": true, "setsid": true, "flock": true, "parallel": true, "script": true, "runuser": true,
 		"chroot": true, "nsenter": true, "unshare": true, "systemd-run": true, "sg": true, "strace": true,
-		"ltrace": true, "arch": true, "nohup.exe": true}
+		"ltrace": true, "arch": true, "nohup.exe": true,
+		// zsh's precommand modifiers and repeat, and bash's coproc.
+		"noglob": true, "nocorrect": true, "repeat": true, "coproc": true}
 	// Interpreters: their arguments, here-docs and stdin are code too.
 	interpreter = regexp.MustCompile(`^(python[0-9.]*|perl[0-9.]*|ruby[0-9.]*|node|nodejs|deno|bun|php[0-9.]*|` +
 		`[gmn]?awk|osascript|expect|tclsh|wish|lua[0-9.]*|Rscript|pwsh|swift|groovy|jshell|irb)$`)
@@ -303,6 +309,7 @@ var (
 		"yq": true, "sort": true, "uniq": true, "cut": true, "tr": true, "column": true, "test": true, "[": true,
 		"true": true, "false": true, "stat": true, "file": true, "basename": true, "dirname": true,
 		"realpath": true, "readlink": true, "pwd": true, "cd": true, "man": true, "which": true, "type": true,
+		"whereis": true, "whatis": true, "apropos": true, "locate": true, "info": true, "tldr": true,
 		// Loop and case words: a list of words, not a program.
 		"for": true, "select": true, "case": true}
 	reserved = map[string]bool{"!": true, "{": true, "}": true, "if": true, "then": true, "else": true,
@@ -344,8 +351,50 @@ func textVerdict(s string) verdict {
 	if pattern.MatchString(s) || pattern.MatchString(unquoted.Replace(s)) {
 		v = denyRoot
 	}
+	return worse(v, cacheText(s))
+}
+
+// cacheText is the credential-store part of the plain-text rule.
+func cacheText(s string) verdict {
 	if cacheToolPat.MatchString(s) && (cachePattern.MatchString(s) || credReadPat.MatchString(s)) {
-		v = worse(v, denyCache)
+		return denyCache
+	}
+	return allow
+}
+
+// rootNames are the programs that are sudo or sshpass. Ubuntu 25.10 and
+// later install sudo-rs and the original sudo as sudo-ws next to sudo.
+var rootNames = map[string]bool{"sudo": true, "sshpass": true, "sudo-rs": true, "sudo-ws": true}
+
+// rootPath is an argument that only names sudo or sshpass, as a file or a
+// package: sudo, /usr/bin/sudo. It is data (readlink -f /usr/bin/sudo,
+// dpkg-query -W sudo, find / -name sudo).
+var rootPath = regexp.MustCompile(`^([^\s!|;&()` + "`" + `'"=]*/)?(sudo|sshpass|sudo-rs|sudo-ws)$`)
+
+// runForm is sudo or sshpass in an argument written as something to run: a
+// command line (sudo id, '!sudo id', LESSOPEN='|sudo id %s') or a value that
+// names the program (SUDO=sudo, --compress-program=/usr/bin/sudo,
+// core.pager=sudo). sudo inside a longer name is not (sudo-rs as part of a
+// URL, src/sudo/pam.rs, my-sudo-notes), and neither is the project's name.
+var runForm = regexp.MustCompile(`(^|[\s!|;&()` + "`" + `'"=])([^\s!|;&()` + "`" + `'"=]*/)?(sudo|sshpass|sudo-rs|sudo-ws)(\s+\S|$)`)
+
+// argVerdict judges an argument of a program that is not a code carrier:
+// sudo there is denied only in runForm. Text that reaches a shell later
+// loses its quotes and backslashes (s\udo), so it is matched once more
+// without them, like textVerdict. $'…' cannot be read, so it is denied.
+func argVerdict(w word) verdict {
+	if w.opaque {
+		return denyRoot
+	}
+	v := allow
+	for _, t := range append([]string{w.text}, w.alts...) {
+		t = strings.ReplaceAll(t, ownName, "x")
+		for _, s := range []string{t, unquoted.Replace(t)} {
+			if !rootPath.MatchString(s) && runForm.MatchString(s) {
+				v = denyRoot
+			}
+		}
+		v = worse(v, cacheText(t))
 	}
 	return v
 }
@@ -1227,20 +1276,28 @@ func commandWord(words []word, from int) int {
 
 func (pl *pipeline) verdict(full, self string, depth int) verdict {
 	v := allow
-	carrierInPipe, shellInPipe, localShell := false, false, false
-	for _, c := range pl.cmds {
+	shellInPipe, localShell := false, false
+	lastCarrier, allParsed := -1, true
+	for i, c := range pl.cmds {
 		cv, carrier := c.verdict(full, self, depth)
 		v = worse(v, cv)
-		carrierInPipe = carrierInPipe || carrier
+		if carrier {
+			lastCarrier, allParsed = i, allParsed && c.parsed
+		}
 		if sh, local := c.runsShell(self, depth); sh {
 			shellInPipe, localShell = true, localShell || local
 		}
 	}
-	if carrierInPipe {
-		// Data piped into a shell or ssh is code.
-		for _, c := range pl.cmds {
-			v = worse(v, c.textVerdict())
+	// Data piped into a shell or ssh is code, so what comes before the last
+	// one is matched as text. What comes after it only reads its output
+	// (ssh h 'cat /etc/sudoers' | grep sudo). A shell or ssh in the pipe was
+	// judged above, its code parsed, and so is what echo and printf print
+	// into one (below), unless an interpreter in the pipe may change it.
+	for i, c := range pl.cmds[:lastCarrier+1] {
+		if c.parsed || i < lastCarrier && shellInPipe && allParsed && c.echoes() {
+			continue
 		}
+		v = worse(v, c.textVerdict())
 	}
 	if shellInPipe {
 		for _, c := range pl.cmds {
@@ -1254,11 +1311,18 @@ func (pl *pipeline) verdict(full, self string, depth int) verdict {
 	return v
 }
 
+// echoes reports whether c is echo or printf, whose output printed judges.
+func (c *simpleCmd) echoes() bool {
+	k := commandWord(c.words, 0)
+	return k >= 0 && (c.words[k].text == "echo" || c.words[k].text == "printf")
+}
+
 // printed judges what c prints, as code for a shell that reads it: the
 // arguments of echo and printf, and here-documents (cat <<'EOF' | sh).
 func (c *simpleCmd) printed(depth int, self string) verdict {
 	v := allow
-	if k := commandWord(c.words, 0); k >= 0 && (c.words[k].text == "echo" || c.words[k].text == "printf") {
+	if c.echoes() {
+		k := commandWord(c.words, 0)
 		v = code(joinWords(c.words[k+1:]), anyDynamic(c.words[k+1:]), depth, self)
 	}
 	for _, d := range c.heredocs {
@@ -1414,11 +1478,52 @@ func globRoot(w word) bool {
 // by name, by one of its brace expansions, or as a pattern that matches them.
 func namesRoot(w word) bool {
 	for _, t := range append([]string{w.text}, w.alts...) {
-		if n := base(t); n == "sudo" || n == "sshpass" {
+		if rootNames[base(t)] {
 			return true
 		}
 	}
 	return globRoot(w)
+}
+
+// markCode records that codeVerdict parsed and judged w as code. A word made
+// up by the guard (no place in the source) is not recorded.
+func (c *simpleCmd) markCode(w word) {
+	if w.end == 0 {
+		return
+	}
+	if c.code == nil {
+		c.code = map[int]bool{}
+	}
+	c.code[w.start] = true
+}
+
+// carrierWords judges the words of a shell, ssh, eval, su or trap after
+// codeVerdict: the words it parsed as code are already judged, the others
+// (options, the host, a script's arguments) are judged as arguments
+// (argVerdict), and a pattern that matches sudo (ssh h /usr/bin/su?o id) as
+// sudo. Its here-documents and here-strings are matched as text, and its
+// words together for a credential-store read.
+func (c *simpleCmd) carrierWords() verdict {
+	v := cacheText(joinWords(c.words))
+	for _, w := range c.words {
+		if globRoot(w) {
+			v = worse(v, denyRoot)
+		}
+		if w.end > 0 && c.code[w.start] {
+			continue
+		}
+		v = worse(v, argVerdict(w))
+		if globRoot(w) {
+			v = worse(v, denyRoot)
+		}
+	}
+	for _, d := range c.heredocs {
+		v = worse(v, textVerdict(d.body))
+	}
+	for _, h := range c.herestr {
+		v = worse(v, textVerdict(h))
+	}
+	return v
 }
 
 func (c *simpleCmd) textVerdict() verdict {
@@ -1483,12 +1588,22 @@ func (c *simpleCmd) verdict(full, self string, depth int) (verdict, bool) {
 				return denyCache, false
 			}
 			return allow, false
-		case carriers[name] || interpreter.MatchString(name):
+		case carriers[name]:
+			// Its code is parsed and judged (codeVerdict), so its words are
+			// judged as arguments, not matched as text: ssh h 'readlink -f
+			// /usr/bin/sudo' reads a path, ssh h 'sudo id' runs sudo.
+			c.parsed = true
+			cv := c.codeVerdict(name, k, self, depth) // first: it marks the code words
+			return worse(cv, c.carrierWords()), true
+		case interpreter.MatchString(name):
+			// Its code is not parsed: matched as text.
 			return worse(c.textVerdict(), c.codeVerdict(name, k, self, depth)), true
 		case wrappers[name]:
-			// Any later word that names sudo or sshpass is what it runs.
+			// Any later word that names sudo or sshpass is what it runs. find
+			// is the exception: its -exec commands are judged one by one
+			// below, and its other words are paths and tests (-name sudo).
 			for _, w := range c.words[k+1:] {
-				if namesRoot(w) {
+				if name != "find" && namesRoot(w) {
 					return denyRoot, false
 				}
 			}
@@ -1507,6 +1622,12 @@ func (c *simpleCmd) verdict(full, self string, depth int) (verdict, bool) {
 			if next >= len(c.words) {
 				return allow, false
 			}
+			if (name == "xargs" || name == "parallel") && takesProgramFromInput(name, c.words, k, next) {
+				// Its input names the program: what is piped into it is
+				// judged like data piped into a shell, and its own words
+				// (parallel's ::: inputs) as text.
+				return c.textVerdict(), true
+			}
 			if name == "watch" || name == "sg" {
 				// They hand the rest to sh -c as one string.
 				return worse(c.textVerdict(), code(joinWords(c.words[next:]), anyDynamic(c.words[next:]), depth, self)), true
@@ -1516,9 +1637,44 @@ func (c *simpleCmd) verdict(full, self string, depth int) (verdict, bool) {
 		case dataCommands[name]:
 			return c.dataVerdict(name, k), false
 		}
-		// Unknown program: fail closed on its full text.
-		return c.textVerdict(), false
+		return c.unknownVerdict(k), false
 	}
+}
+
+// unknownVerdict judges a program the guard does not know at k. Its name is
+// matched as text, so a program called ./sudo-helper is denied. Its
+// arguments and the assignments before it are judged one by one (argVerdict):
+// sudo written as something to run is denied, a word that only names sudo is
+// data (dpkg-query -W sudo). Its here-documents and here-strings are matched
+// as text, since it may read them as code, and all its words together for a
+// credential-store read, which spans several words.
+//
+// Some unknown programs run their arguments (a program merely named psudo, a
+// shell's precommand modifier the guard does not list), so sudo, or a
+// pattern that matches it, as the very next word is denied: X sudo id.
+// A program named psudo that is not the installed one is judged on its
+// full text.
+func (c *simpleCmd) unknownVerdict(k int) verdict {
+	if base(c.words[k].text) == "psudo" {
+		return c.textVerdict()
+	}
+	v := textVerdict(c.words[k].text)
+	if k+1 < len(c.words) && namesRoot(c.words[k+1]) {
+		v = denyRoot
+	}
+	for i, w := range c.words {
+		if i != k {
+			v = worse(v, argVerdict(w))
+		}
+	}
+	v = worse(v, cacheText(joinWords(c.words)))
+	for _, d := range c.heredocs {
+		v = worse(v, textVerdict(d.body))
+	}
+	for _, h := range c.herestr {
+		v = worse(v, textVerdict(h))
+	}
+	return v
 }
 
 // wordVerdict judges one word as text; $'…' content cannot be judged.
@@ -1547,6 +1703,9 @@ func (c *simpleCmd) codeVerdict(name string, k int, self string, depth int) verd
 	// subWords judges the code that words make, once for each value a
 	// variable among them was given in this command (ssh host "$CMD").
 	subWords := func(ws []word) verdict {
+		for _, w := range ws {
+			c.markCode(w)
+		}
 		r := allow
 		for _, ct := range c.codeOf(ws) {
 			if ct.tooMany {
@@ -1575,6 +1734,7 @@ func (c *simpleCmd) codeVerdict(name string, k int, self string, depth int) verd
 	case shells[name]:
 		for _, w := range c.words[:k] {
 			if name, value, ok := strings.Cut(w.text, "="); ok && promptVars[name] {
+				c.markCode(w)
 				v = worse(v, sub(value, w.dynamic))
 			}
 		}
@@ -1624,6 +1784,7 @@ func (c *simpleCmd) codeVerdict(name string, k int, self string, depth int) verd
 					if t[j] == 'o' {
 						key, rest, _ := strings.Cut(strings.TrimLeft(value, " "), "=")
 						if strings.HasSuffix(strings.ToLower(strings.TrimSpace(key)), "command") {
+							c.markCode(args[i])
 							v = worse(v, subWords([]word{{text: rest, dynamic: judged}}))
 						}
 					}
@@ -1633,7 +1794,13 @@ func (c *simpleCmd) codeVerdict(name string, k int, self string, depth int) verd
 			}
 			// args[i] is the host; the rest is the remote command.
 			if i+1 < len(args) {
-				v = worse(v, remote(subWords(args[i+1:])))
+				rv := subWords(args[i+1:])
+				if rv == denyDynamic && textVerdict(joinWords(args[i+1:])) == denyRoot {
+					// A computed program on the host is allowed, unless the
+					// code mentions sudo: S=$(which sudo); $S id.
+					rv = denyRoot
+				}
+				v = worse(v, remote(rv))
 			}
 			break
 		}
@@ -1646,6 +1813,7 @@ func (c *simpleCmd) codeVerdict(name string, k int, self string, depth int) verd
 			if (w.text == "-c" || w.text == "--command") && i+1 < len(args) {
 				v = worse(v, subWords(args[i+1:i+2]))
 			} else if value, ok := strings.CutPrefix(w.text, "--command="); ok {
+				c.markCode(w)
 				v = worse(v, sub(value, w.dynamic))
 			}
 		}
@@ -1674,16 +1842,84 @@ func (c *simpleCmd) findVerdict(k int, full, self string, depth int) verdict {
 			for j < len(c.words) && c.words[j].text != ";" && c.words[j].text != "+" {
 				j++
 			}
-			if j > i+1 {
+			if j > i+1 && strings.Contains(c.words[i+1].text, "{}") {
+				// The program is a file find found: it may be sudo.
+				if !c.findExcludesRoot(k) {
+					v = worse(v, denyRoot)
+				}
+				v = worse(v, (&simpleCmd{words: c.words[i+1 : j]}).textVerdict())
+			} else if j > i+1 {
 				sv, _ := (&simpleCmd{words: c.words[i+1 : j]}).verdict(full, self, depth)
 				v = worse(v, sv)
 			}
 			i = j
 		default:
-			v = worse(v, wordVerdict(c.words[i]))
+			v = worse(v, argVerdict(c.words[i]))
 		}
 	}
 	return v
+}
+
+// findExcludesRoot reports whether find at k selects files by name in a way
+// that can never select sudo or sshpass: at least one -name or -iname, and
+// none whose pattern matches one of them. -path, -regex and their kin are
+// not read, so with any of them find may select anything.
+func (c *simpleCmd) findExcludesRoot(k int) bool {
+	named := false
+	for i := k + 1; i < len(c.words); i++ {
+		switch t := c.words[i].text; t {
+		case "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex", "-lname", "-ilname":
+			return false
+		case "-name", "-iname":
+			if i+1 >= len(c.words) || c.words[i+1].dynamic || c.words[i+1].opaque {
+				return false
+			}
+			pat := c.words[i+1].text
+			for name := range rootNames {
+				if ok, err := path.Match(pat, name); ok || err != nil ||
+					t == "-iname" && strings.EqualFold(pat, name) {
+					return false
+				}
+				if ok, _ := path.Match(strings.ToLower(pat), name); t == "-iname" && ok {
+					return false
+				}
+			}
+			named = true
+			i++
+		}
+	}
+	return named
+}
+
+// takesProgramFromInput reports whether xargs or parallel at k, whose
+// program word is at next, runs a program named by its input: the program
+// word holds the replacement string (-I %, --replace, -i, parallel's {}).
+func takesProgramFromInput(name string, words []word, k, next int) bool {
+	if next >= len(words) {
+		return false
+	}
+	prog := words[next].text
+	if strings.ContainsAny(prog, "{}") {
+		return true
+	}
+	for i := k + 1; i < next; i++ {
+		t := words[i].text
+		var repl string
+		switch {
+		case t == "-I" && i+1 < next:
+			repl = words[i+1].text
+		case strings.HasPrefix(t, "-I") && len(t) > 2:
+			repl = t[2:]
+		case strings.HasPrefix(t, "--replace="):
+			repl = strings.TrimPrefix(t, "--replace=")
+		case strings.HasPrefix(t, "-i") && len(t) > 2 && name == "xargs":
+			repl = t[2:]
+		}
+		if repl != "" && strings.Contains(prog, repl) {
+			return true
+		}
+	}
+	return false
 }
 
 // wrapSpec describes how a wrapper finds the program it runs.
@@ -1716,6 +1952,7 @@ var wrapSpecs = map[string]wrapSpec{
 	"watch":       {values: "n", long: []string{"--interval"}},
 	"systemd-run": {values: "pEuMH", long: []string{"--property", "--setenv", "--unit", "--machine", "--host"}},
 	"nsenter":     {values: "tSG", long: []string{"--target", "--setuid", "--setgid"}},
+	"repeat":      {pos: 1},
 }
 
 // wrapped returns the index of the program a wrapper at k runs, skipping its
@@ -1795,6 +2032,15 @@ func wrapped(name string, words []word, k int, self string, depth int) (int, ver
 	return len(words), v
 }
 
+// ghBuiltins are gh's own commands other than alias, config and extension,
+// which define what other commands run. Any other first word may be an
+// alias or an extension, a program of its own.
+var ghBuiltins = map[string]bool{"agent-task": true, "api": true, "attestation": true, "auth": true,
+	"browse": true, "cache": true, "codespace": true, "completion": true, "copilot": true, "gist": true,
+	"gpg-key": true, "issue": true, "label": true, "org": true, "pr": true, "preview": true, "project": true,
+	"release": true, "repo": true, "ruleset": true, "run": true, "search": true, "secret": true,
+	"ssh-key": true, "status": true, "variable": true, "workflow": true}
+
 // commitCluster is git commit flags that take no value, ending in -m.
 var commitCluster = regexp.MustCompile(`^-[aeinopqsv]+m$`)
 
@@ -1803,23 +2049,48 @@ var commitCluster = regexp.MustCompile(`^-[aeinopqsv]+m$`)
 var textArgs = map[string]bool{"echo": true, "printf": true, "grep": true, "egrep": true, "fgrep": true}
 
 // dataVerdict judges a data program at index k. Its here-documents and
-// here-strings are text. Its arguments are text only for textArgs and for
-// the message of git commit -m. Everything else, including variables set
-// before it (GIT_PAGER=…, LESSOPEN=…) and options that run a program
-// (man -P, rg --pre, sort --compress-program, git --upload-pack), is judged
-// as text.
+// here-strings are text. Its arguments are text for textArgs and for the
+// message of git commit -m. Its other arguments and the variables set before
+// it are judged one by one (argVerdict): sudo written as something to run is
+// denied (GIT_PAGER='sudo id', man -P 'sudo id', sort
+// --compress-program=sudo, git --upload-pack='sudo x'), and a word that only
+// names sudo is data (readlink -f /usr/bin/sudo, gh api …/sudo-rs/…).
+//
+// Where a bare name becomes a program, every argument is matched as text
+// instead: git config and git -c (core.pager sudo), gh alias, gh config
+// (pager sudo) and gh extensions, and ln (ln -s /usr/bin/sudo x makes x run
+// sudo).
 func (c *simpleCmd) dataVerdict(name string, k int) verdict {
 	v := allow
 	for _, w := range c.words[:k] {
-		v = worse(v, wordVerdict(w))
+		v = worse(v, argVerdict(w))
 	}
 	if textArgs[name] {
 		return v
 	}
 	args := c.words[k+1:]
+	strict := name == "ln" ||
+		name == "git" && slices.ContainsFunc(args, func(w word) bool {
+			return w.text == "config" || strings.HasPrefix(w.text, "-c")
+		}) ||
+		name == "gh" && len(args) > 0 && !ghBuiltins[args[0].text]
+	judge := argVerdict
+	if strict {
+		judge = wordVerdict
+	}
 	commit := name == "git" && len(args) > 0 && args[0].text == "commit"
+	// gh's built-in commands never run an argument as a program, so a title,
+	// a body or an API path is text. After --, gh repo clone and gh repo
+	// fork hand the words to git, so they are judged as arguments.
+	ghText := !strict && name == "gh" && len(args) > 0 && ghBuiltins[args[0].text]
 	for i := 0; i < len(args); i++ {
 		t := args[i].text
+		if ghText {
+			if t == "--" {
+				ghText = false
+			}
+			continue
+		}
 		if commit && (t == "-m" || t == "--message" || commitCluster.MatchString(t)) {
 			i++ // the message itself (-m, or a cluster ending in it: -am, -qm)
 			continue
@@ -1827,7 +2098,7 @@ func (c *simpleCmd) dataVerdict(name string, k int) verdict {
 		if commit && (strings.HasPrefix(t, "-m") || strings.HasPrefix(t, "--message=")) {
 			continue
 		}
-		v = worse(v, wordVerdict(args[i]))
+		v = worse(v, judge(args[i]))
 	}
 	return v
 }
